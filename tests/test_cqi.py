@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import pandas as pd
@@ -62,6 +63,17 @@ class CQITest(unittest.TestCase):
             with self.assertRaisesRegex(cqi.PipelineError, "observation date"):
                 cqi.fetch_admin_rate()
 
+    def test_fred_requests_only_needed_dates_and_caps_discontinued_ioer(self):
+        responses = [b"observation_date,IOER\n2021-07-28,0.15\n",
+                     b"observation_date,IORB\n2024-06-10,5.4\n"]
+        with patch.object(cqi, "get", side_effect=responses) as get:
+            result = cqi.fetch_admin_rate()
+        self.assertEqual(set(result["series"]), {"IOER", "IORB"})
+        for call, sid, end in zip(get.call_args_list, ("IOER", "IORB"), ("2021-07-28", cqi.END)):
+            query = parse_qs(urlparse(call.args[0]).query)
+            self.assertEqual(query, {"id": [sid], "cosd": [cqi.START], "coed": [end]})
+            self.assertFalse(call.kwargs["as_json"])
+
     def test_buyback_known_schema_aliases_are_normalized(self):
         data = pd.DataFrame({"operation_date": ["2024-06-07"], "total_par_amt_offered": ["3,000"],
                              "total_par_amt_accepted": ["1,000"], "security_type": ["Nominal Coupon"]})
@@ -92,10 +104,97 @@ class CQITest(unittest.TestCase):
         self.assertEqual(parse_qs(parsed.query)["page[number]"], ["2"])
         self.assertEqual(parse_qs(parsed.query)["page[size]"], ["1"])
 
-    def test_cftc_archive_failure_is_not_silently_skipped(self):
+    @staticmethod
+    def cftc_row(date="2024-06-04", market="UST 10Y NOTE - CHICAGO BOARD OF TRADE", **changes):
+        return {"market_and_exchange_names": market, "report_date_as_yyyy_mm_dd": date + "T00:00:00.000",
+                "lev_money_positions_short": "1234", "lev_money_positions_long": "567",
+                "futonly_or_combined": "FutOnly", **changes}
+
+    def test_cftc_api_failure_is_not_silently_skipped_or_overwritten(self):
+        target = cqi.RAW / "cftc_tff.csv"
+        target.parent.mkdir(parents=True)
+        target.write_text("previous good file")
         with patch.object(cqi, "get", side_effect=RuntimeError("network unavailable")):
-            with self.assertRaisesRegex(cqi.PipelineError, "CFTC 2016: network unavailable"):
+            with self.assertRaisesRegex(cqi.PipelineError, "CFTC API: network unavailable"):
                 cqi.fetch_cftc()
+        self.assertEqual(target.read_text(), "previous good file")
+
+    def test_cftc_api_paginates_and_preserves_normalized_contract(self):
+        rows = [self.cftc_row(date="2016-01-05"), self.cftc_row(date="2024-05-28"), self.cftc_row()]
+        count = [{"row_count": "3"}]
+        with patch.object(cqi, "CFTC_PAGE_SIZE", 2), patch.object(cqi, "get", side_effect=[count, rows[:2], rows[2:], count]) as get:
+            result = cqi.fetch_cftc()
+        self.assertEqual(result.columns.tolist(), ["market", "date", "lev_short", "lev_long"])
+        self.assertEqual(len(result), 3)
+        self.assertTrue(result["lev_short"].eq(1234).all())
+        self.assertTrue(result["lev_long"].eq(567).all())
+        self.assertEqual(result["date"].max(), pd.Timestamp("2024-06-04"))
+        self.assertTrue((cqi.RAW / "cftc_tff.csv").exists())
+        queries = [parse_qs(urlparse(call.args[0]).query) for call in get.call_args_list]
+        self.assertEqual(queries[1]["$offset"], ["0"])
+        self.assertEqual(queries[2]["$offset"], ["2"])
+        self.assertEqual(queries[1]["$limit"], ["2"])
+        self.assertEqual(queries[2]["$limit"], ["1"])
+        self.assertEqual(queries[1]["$order"], ["report_date_as_yyyy_mm_dd,market_and_exchange_names"])
+        self.assertEqual(queries[0]["$where"], queries[-1]["$where"])
+        for query in queries:
+            where = query["$where"][0]
+            for required in ("futonly_or_combined = 'FutOnly'", "2016-01-01T00:00:00", "2024-06-11T00:00:00",
+                             "'%UST%'", "'%TREASURY%'", "'%NOTE%'", "'%BOND%'", "not like '%MICRO%'", "not like '%SWAP%'"):
+                self.assertIn(required, where)
+
+    def test_cftc_api_invalid_or_unbounded_count_fails_before_data_fetch(self):
+        for response in ({"error": "bad request"}, [], [{"row_count": "0"}], [{"row_count": "1.5"}],
+                         [{"row_count": "-1"}], [{"row_count": "100001"}]):
+            with self.subTest(response=response), patch.object(cqi, "get", return_value=response) as get:
+                with self.assertRaises(cqi.PipelineError):
+                    cqi.fetch_cftc()
+                self.assertEqual(get.call_count, 1)
+        self.assertFalse((cqi.RAW / "cftc_tff.csv").exists())
+
+    def test_cftc_api_incomplete_page_fails(self):
+        with patch.object(cqi, "get", side_effect=[[{"row_count": "2"}], [self.cftc_row()]]):
+            with self.assertRaisesRegex(cqi.PipelineError, "incomplete pagination"):
+                cqi.fetch_cftc()
+        self.assertFalse((cqi.RAW / "cftc_tff.csv").exists())
+
+    def test_cftc_api_count_change_during_pagination_fails(self):
+        with patch.object(cqi, "get", side_effect=[[{"row_count": "1"}], [self.cftc_row()], [{"row_count": "2"}]]):
+            with self.assertRaisesRegex(cqi.PipelineError, "count changed"):
+                cqi.fetch_cftc()
+
+    def test_cftc_api_repeated_page_is_not_silently_deduplicated(self):
+        count = [{"row_count": "2"}]
+        with patch.object(cqi, "CFTC_PAGE_SIZE", 1), patch.object(cqi, "get", side_effect=[count, [self.cftc_row()], [self.cftc_row()], count]):
+            with self.assertRaisesRegex(cqi.PipelineError, "duplicate market/date"):
+                cqi.fetch_cftc()
+
+    def test_cftc_api_missing_field_fails(self):
+        row = self.cftc_row()
+        del row["lev_money_positions_short"]
+        count = [{"row_count": "1"}]
+        with patch.object(cqi, "get", side_effect=[count, [row], count]):
+            with self.assertRaisesRegex(cqi.PipelineError, "missing required columns"):
+                cqi.fetch_cftc()
+
+    def test_cftc_api_invalid_counts_fail(self):
+        count = [{"row_count": "1"}]
+        for bad in (None, "unknown", "NaN", "inf", "-1", "1.5", True):
+            with self.subTest(value=bad), patch.object(cqi, "get", side_effect=[count, [self.cftc_row(lev_money_positions_short=bad)], count]):
+                with self.assertRaisesRegex(cqi.PipelineError, "invalid position counts"):
+                    cqi.fetch_cftc()
+
+    def test_cftc_api_out_of_scope_and_stale_records_fail(self):
+        rows = [self.cftc_row(futonly_or_combined="Combined"), self.cftc_row(date="2015-12-29"),
+                self.cftc_row(date="2024-06-11"), self.cftc_row(date="2024-01-02"),
+                self.cftc_row(market="MICRO UST 10Y NOTE"), self.cftc_row(market="UST NOTE SWAP"),
+                self.cftc_row(market="EURO FX"), self.cftc_row(market="UST INDEX")]
+        count = [{"row_count": "1"}]
+        for row in rows:
+            with self.subTest(row=row), patch.object(cqi, "get", side_effect=[count, [row], count]):
+                with self.assertRaises(cqi.PipelineError):
+                    cqi.fetch_cftc()
+        self.assertFalse((cqi.RAW / "cftc_tff.csv").exists())
 
     def test_stale_source_fails_even_with_many_rows(self):
         data = pd.DataFrame({"date": pd.bdate_range("2020-01-01", "2023-12-29"), "sofr": 5.0})

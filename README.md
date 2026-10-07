@@ -37,3 +37,15 @@ PR 运行单元测试和真实抓取/生成，**不写回仓库**。
 - 周末、假日、周/月/季频发布有滞后；新鲜度检查按来源容忍合理间隔
 - 外部 API 的限流、字段或网址变化会使真实抓取失败，必须查看日志修复，不能绕过错误
 - 不要提交密钥、私人 manual 数据或合成演示结果
+
+### 官方程序化入口
+
+CFTC 使用官方 Public Reporting Environment 的 TFF Futures Only API
+（数据集 gpe5-46if），按模型所需日期和国债市场筛选、分页并核对总数，
+无需每天下载 2016 年起的全部年度 ZIP。该入口由 CFTC 官方明确提供：
+https://publicreporting.cftc.gov/stories/s/TFF-Futures-Only/98ig-3k9y/
+其官方 FAQ 说明与传统报告使用相同源数据：
+https://publicreporting.cftc.gov/stories/s/Public-Reporting-FAQ/inwp-fmhz/
+
+FRED 请求限定模型所需日期（CQI 从 2018-04-02，面板从 2015-01-01），
+降低无关历史传输量。每次仍必须取得并验证源数据；不以旧缓存替代失败的刷新。

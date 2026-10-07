@@ -13,9 +13,10 @@ HQ Research · 美债体系卷六 · V0.1
 
 依赖：pandas、numpy、requests；画图可选 matplotlib。
 """
-import argparse, io, json, os, sys, tempfile, time, zipfile
+import argparse, io, json, os, sys, tempfile, time
 from datetime import date, datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -42,8 +43,10 @@ URL = {
                  "&dateFieldName=auctionDate&compact=false&format=json"),
     "buybacks": ("https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
                  "v1/accounting/od/buybacks_operations?page[size]=10000"),
-    "cftc_tff": "https://www.cftc.gov/files/dea/history/fut_fin_txt_{y}.zip",
+    "cftc_tff": "https://publicreporting.cftc.gov/resource/gpe5-46if.json",
 }
+CFTC_PAGE_SIZE = 5000
+CFTC_MAX_PAGES = 20
 
 # 回测事件：卷六第二节
 EVENTS = {
@@ -276,7 +279,9 @@ def fetch_sofr():
 def fetch_admin_rate():
     frames = []
     for sid in ("IOER", "IORB"):
-        raw = get(URL["fred_csv"].format(sid=sid), as_json=False)
+        end = min(END, "2021-07-28") if sid == "IOER" else END
+        url = URL["fred_csv"].format(sid=sid) + "&" + urlencode({"cosd": START, "coed": end})
+        raw = get(url, as_json=False)
         d = pd.read_csv(io.BytesIO(raw))
         d.columns = d.columns.str.strip()
         date_col = pick_column(d, ["observation_date", "DATE", "date"], sid, "observation date")
@@ -347,30 +352,78 @@ def fetch_buybacks():
     return save_source("buybacks", pd.concat(frames, ignore_index=True))
 
 
+def cftc_query(**query):
+    """Official TFF futures-only API; use the same Treasury contract universe as before."""
+    next_day = (pd.Timestamp(END) + pd.Timedelta(days=1)).date().isoformat()
+    market = "upper(market_and_exchange_names)"
+    where = ("futonly_or_combined = 'FutOnly' "
+             "AND report_date_as_yyyy_mm_dd >= '2016-01-01T00:00:00' "
+             f"AND report_date_as_yyyy_mm_dd < '{next_day}T00:00:00' "
+             f"AND ({market} like '%UST%' OR {market} like '%TREASURY%') "
+             f"AND ({market} like '%NOTE%' OR {market} like '%BOND%') "
+             f"AND {market} not like '%MICRO%' AND {market} not like '%SWAP%'")
+    return URL["cftc_tff"] + "?" + urlencode({"$where": where, **query})
+
+
 def fetch_cftc():
-    frames = []
-    for y in range(2016, pd.Timestamp(END).year + 1):
-        try:
-            with zipfile.ZipFile(io.BytesIO(get(URL["cftc_tff"].format(y=y), as_json=False))) as z:
-                members = [n for n in z.namelist() if n.lower().endswith((".txt", ".csv")) and not n.endswith("/")]
-                if not members:
-                    raise PipelineError("archive has no CSV/TXT data member")
-                for name in members:
-                    frame = pd.read_csv(z.open(name), low_memory=False)
-                    if frame.empty:
-                        raise PipelineError(f"empty archive member {name}")
-                    frames.append(frame)
-        except Exception as ex:
-            raise PipelineError(f"CFTC {y}: {ex}") from ex
-    df = pd.concat(frames, ignore_index=True)
-    df.columns = df.columns.str.strip()
-    name_col = pick_column(df, [], "cftc", "market", lambda c: "market_and_exchange" in c.lower())
-    date_col = pick_column(df, [], "cftc", "report date", lambda c: c.lower().startswith("report_date_as_yyyy"))
-    short_col = pick_column(df, [], "cftc", "leveraged short", lambda c: c.lower().startswith("lev_money_positions_short"))
-    long_col = pick_column(df, [], "cftc", "leveraged long", lambda c: c.lower().startswith("lev_money_positions_long"))
-    df = df[[name_col, date_col, short_col, long_col]]
-    df.columns = ["market", "date", "lev_short", "lev_long"]
-    return save_source("cftc", df)
+    # CFTC documents anonymous API access and the historical PRE datasets in FAQ 12–13:
+    # https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm
+    columns = {"market_and_exchange_names": "market", "report_date_as_yyyy_mm_dd": "date",
+               "lev_money_positions_short": "lev_short", "lev_money_positions_long": "lev_long"}
+
+    def row_count():
+        response = get(cftc_query(**{"$select": "count(*) as row_count"}))
+        if (not isinstance(response, list) or len(response) != 1
+                or not isinstance(response[0], dict)
+                or not str(response[0].get("row_count", "")).isdecimal()):
+            raise PipelineError("invalid row count response")
+        count = int(response[0]["row_count"])
+        if count == 0:
+            raise PipelineError("empty response/data")
+        if count > CFTC_PAGE_SIZE * CFTC_MAX_PAGES:
+            raise PipelineError("row count exceeds pagination limit")
+        return count
+
+    try:
+        expected = row_count()
+        rows = []
+        for offset in range(0, expected, CFTC_PAGE_SIZE):
+            limit = min(CFTC_PAGE_SIZE, expected - offset)
+            page = get(cftc_query(**{
+                "$select": ",".join(columns) + ",futonly_or_combined",
+                "$order": "report_date_as_yyyy_mm_dd,market_and_exchange_names",
+                "$limit": limit, "$offset": offset,
+            }))
+            if not isinstance(page, list) or not all(isinstance(row, dict) for row in page):
+                raise PipelineError("expected a JSON data array")
+            if len(page) != limit:
+                raise PipelineError("incomplete pagination: unexpected page length")
+            rows.extend(page)
+        if row_count() != expected:
+            raise PipelineError("row count changed during pagination; retry the fetch")
+        df = pd.DataFrame(rows)
+        require_columns(df, list(columns) + ["futonly_or_combined"], "cftc")
+        if not df["futonly_or_combined"].eq("FutOnly").all():
+            raise PipelineError("unexpected non-futures-only records")
+        df = df[list(columns)].rename(columns=columns)
+        dates = pd.to_datetime(df["date"], errors="coerce")
+        if dates.isna().any() or not dates.between("2016-01-01", END).all():
+            raise PipelineError("invalid or out-of-range report dates")
+        df["date"] = dates.dt.normalize()
+        if df.duplicated(["date", "market"]).any():
+            raise PipelineError("duplicate market/date records in pagination")
+        for column in ("lev_short", "lev_long"):
+            values = num(df[column])
+            if (df[column].map(lambda value: isinstance(value, bool)).any()
+                    or (values.isna() | ~np.isfinite(values) | (values < 0) | (values % 1 != 0)).any()):
+                raise PipelineError("invalid position counts")
+            df[column] = values
+        df, _ = validate_source("cftc", df)
+        if len(df) != expected:
+            raise PipelineError("unexpected contracts or incomplete selected history")
+        return save_source("cftc", df)
+    except Exception as ex:
+        raise PipelineError(f"CFTC API: {ex}") from ex
 
 
 FETCHERS = {"sofr": fetch_sofr, "admin_rate": fetch_admin_rate, "repo_ops": fetch_repo_ops,
@@ -412,7 +465,7 @@ def cmd_probe(_):
         "repo_ops": lambda: get(URL["repo_ops"].format(s="2025-12-29", e="2025-12-31")),
         "auctions": lambda: get(URL["auctions"].format(s="2026-08-10", e="2026-08-14")),
         "buybacks": lambda: get(URL["buybacks"].replace("page[size]=10000", "page[size]=2")),
-        "cftc": lambda: zipfile.ZipFile(io.BytesIO(get(URL["cftc_tff"].format(y=2025), as_json=False))).namelist(),
+        "cftc": lambda: get(cftc_query(**{"$limit": 2, "$order": "report_date_as_yyyy_mm_dd DESC,market_and_exchange_names"})),
     }
     failures = []
     for k, t in tests.items():

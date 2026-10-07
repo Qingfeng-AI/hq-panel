@@ -86,7 +86,7 @@ def cmd_fetch(_):
     failures = []
     for name, sid in SERIES.items():
         try:
-            df = get_csv(FRED.format(sid=sid))
+            df = get_csv(FRED.format(sid=sid) + f"&cosd={START}&coed={END}")
             if df.shape[1] != 2:
                 raise ValueError("FRED 响应必须含日期和一个序列")
             df.columns = ["date", name]

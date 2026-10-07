@@ -47,3 +47,8 @@ class PanelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.object(panel, "MAN", Path(root)):
             frame = pd.DataFrame({"cqi": [2.5, 0.1], "cqi_lamp": ["红", float("nan")]}, index=pd.to_datetime(["2026-10-05", "2026-10-06"]))
             self.assertIn("0.10 | 2026-10-06 | —", panel.report(frame))
+
+    def test_fred_fetch_requests_only_model_date_range(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "get_csv", return_value=pd.DataFrame({"observation_date": ["2026-10-05"], "DGS10": [4.2]})) as get:
+            panel.cmd_fetch(None)
+            self.assertIn("&cosd=" + panel.START + "&coed=" + panel.END, get.call_args.args[0])
