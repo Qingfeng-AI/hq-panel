@@ -28,6 +28,7 @@ class CQITest(unittest.TestCase):
         for name, value in {"RAW": self.root / "data/raw", "OUT": self.root / "data",
                             "REP": self.root / "reports", "END": "2024-06-10"}.items():
             self.stack.enter_context(patch.object(cqi, name, value))
+        self.stack.enter_context(patch.object(cqi, "require_api_key"))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
@@ -59,20 +60,243 @@ class CQITest(unittest.TestCase):
                 cqi.fetch_sofr()
 
     def test_fred_columns_are_validated_not_positional(self):
-        with patch.object(cqi, "get", return_value=b"unexpected,IOER\n2024-06-10,5.0\n"):
-            with self.assertRaisesRegex(cqi.PipelineError, "observation date"):
+        with patch.object(cqi, "fetch_series", return_value=pd.DataFrame({"unexpected": ["2024-06-10"], "value": [5.0]})):
+            with self.assertRaisesRegex(cqi.PipelineError, "missing required columns"):
                 cqi.fetch_admin_rate()
 
     def test_fred_requests_only_needed_dates_and_caps_discontinued_ioer(self):
-        responses = [b"observation_date,IOER\n2021-07-28,0.15\n",
-                     b"observation_date,IORB\n2024-06-10,5.4\n"]
-        with patch.object(cqi, "get", side_effect=responses) as get:
+        responses = [pd.DataFrame({"date": ["2021-07-28"], "value": [0.15]}),
+                     pd.DataFrame({"date": ["2024-06-10"], "value": [5.4]})]
+        with patch.object(cqi, "fetch_series", side_effect=responses) as get:
             result = cqi.fetch_admin_rate()
         self.assertEqual(set(result["series"]), {"IOER", "IORB"})
         for call, sid, end in zip(get.call_args_list, ("IOER", "IORB"), ("2021-07-28", cqi.END)):
-            query = parse_qs(urlparse(call.args[0]).query)
-            self.assertEqual(query, {"id": [sid], "cosd": [cqi.START], "coed": [end]})
-            self.assertFalse(call.kwargs["as_json"])
+            self.assertEqual(call.args, (sid, cqi.START, end))
+
+    def test_trust_fetch_validates_named_columns_and_bounded_dates(self):
+        responses = [pd.DataFrame({"value": [4.4], "date": ["2024-06-10"]}),
+                     pd.DataFrame({"date": ["2024-06-07"], "value": [121.5]})]
+        with patch.object(cqi, "fetch_series", side_effect=responses) as get:
+            result = cqi.fetch_trust()
+        self.assertEqual(set(result["series"]), {"DGS10", "DTWEXBGS"})
+        self.assertTrue((cqi.RAW / "trust.csv").exists())
+        for call, sid in zip(get.call_args_list, ("DGS10", "DTWEXBGS")):
+            self.assertEqual(call.args, (sid, cqi.START, cqi.END))
+
+    def test_fred_failures_identify_the_exact_series_without_raw_exception(self):
+        old = pd.DataFrame({"date": ["2021-07-28"], "value": [0.15]})
+        current = pd.DataFrame({"date": ["2024-06-10"], "value": [4.4]})
+        scenarios = [(cqi.fetch_admin_rate, "IOER", [RuntimeError("private details")]),
+                     (cqi.fetch_admin_rate, "IORB", [old, RuntimeError("private details")]),
+                     (cqi.fetch_trust, "DGS10", [RuntimeError("private details")]),
+                     (cqi.fetch_trust, "DTWEXBGS", [current, RuntimeError("private details")])]
+        for fetch, sid, responses in scenarios:
+            with self.subTest(series=sid), patch.object(cqi, "fetch_series", side_effect=responses):
+                with self.assertRaisesRegex(cqi.PipelineError, sid + ": FRED API request failed") as error:
+                    fetch()
+                self.assertNotIn("private details", str(error.exception))
+
+    def test_trust_requires_both_series_and_checks_each_freshness(self):
+        for stale_sid in ("DGS10", "DTWEXBGS"):
+            rows = [{"date": "2024-05-01" if sid == stale_sid else "2024-06-10",
+                     "value": 4.5 if sid == "DGS10" else 120, "series": sid}
+                    for sid in ("DGS10", "DTWEXBGS")]
+            with self.subTest(series=stale_sid), self.assertRaisesRegex(cqi.PipelineError, stale_sid + " stale"):
+                cqi.validate_source("trust", pd.DataFrame(rows))
+        for sid in ("DGS10", "DTWEXBGS"):
+            with self.subTest(missing=sid), self.assertRaisesRegex(cqi.PipelineError, "both DGS10 and DTWEXBGS"):
+                cqi.validate_source("trust", pd.DataFrame({"date": ["2024-06-10"], "value": [4.5], "series": [sid]}))
+
+    def test_trust_conflicting_duplicates_fail_and_exact_duplicates_deduplicate(self):
+        rows = [{"date": "2024-06-10", "value": 4.5, "series": "DGS10"},
+                {"date": "2024-06-07", "value": 120, "series": "DTWEXBGS"}]
+        result, latest = cqi.validate_source("trust", pd.DataFrame(rows + [rows[0]]))
+        self.assertEqual(len(result), 2)
+        self.assertEqual(latest, "2024-06-07")
+        with self.assertRaisesRegex(cqi.PipelineError, "conflicting duplicate"):
+            cqi.validate_source("trust", pd.DataFrame(rows + [dict(rows[0], value=4.6)]))
+
+    def test_trust_divergence_uses_exact_five_business_day_rule(self):
+        bdays = pd.bdate_range("2024-06-03", periods=6)
+        for dy, dollar_change, expected in ((0.05, -5, 5), (0.05, 5, 0), (-0.05, -5, 0),
+                                            (0, -5, 0), (0.05, 0, 0)):
+            rows = [{"date": day, "value": 4.0 + dy * i / 5, "series": "DGS10"}
+                    for i, day in enumerate(bdays)]
+            rows += [{"date": day, "value": 100 + dollar_change * i / 5, "series": "DTWEXBGS"}
+                     for i, day in enumerate(bdays)]
+            with self.subTest(dy=dy, dollar_change=dollar_change), patch.object(cqi, "read", return_value=pd.DataFrame(rows[::-1])):
+                result = cqi.comp_trust_divergence(bdays)
+            self.assertTrue(result.iloc[:5].isna().all())
+            self.assertAlmostEqual(result.iloc[-1], expected)
+
+    def test_trust_fill_is_chronological_and_limited(self):
+        bdays = pd.bdate_range("2024-05-01", periods=20)
+        rows = [{"date": day, "value": 4.0 + i / 100, "series": "DGS10"}
+                for i, day in enumerate(bdays[:6])]
+        rows += [{"date": day, "value": 100 - i, "series": "DTWEXBGS"}
+                 for i, day in enumerate(bdays[:6])]
+        with patch.object(cqi, "read", return_value=pd.DataFrame(rows).sample(frac=1, random_state=7)):
+            result = cqi.comp_trust_divergence(bdays)
+        self.assertAlmostEqual(result.iloc[5], 5)
+        self.assertAlmostEqual(result.iloc[6], 4)
+        self.assertTrue(result.iloc[11:].isna().all())
+
+    @staticmethod
+    def source_frames():
+        return {
+            "sofr": pd.DataFrame({"date": ["2024-06-10"], "sofr": [5.3]}),
+            "admin_rate": pd.DataFrame({"date": ["2021-07-28", "2024-06-10"], "rate": [0.15, 5.4], "series": ["IOER", "IORB"]}),
+            "trust": pd.DataFrame({"date": ["2024-06-10", "2024-06-07"], "value": [4.4, 120], "series": ["DGS10", "DTWEXBGS"]}),
+            "repo_ops": pd.DataFrame({"operationDate": ["2024-06-10"], "operationType": ["Repo"], "totalAmtAccepted": [1e9]}),
+            "auctions": pd.DataFrame({"auctionDate": ["2024-06-10"], "securityType": ["Note"], "securityTerm": ["10-Year"],
+                                      "bidToCoverRatio": [2.5], "primaryDealerAccepted": [100], "competitiveAccepted": [1000]}),
+            "buybacks": pd.DataFrame({"operation_date": ["2024-06-10"], "total_offered": [300], "total_accepted": [100]}),
+            "cftc": pd.DataFrame({"market": ["UST 10Y NOTE"], "date": ["2024-06-04"], "lev_short": [100], "lev_long": [50]}),
+        }
+
+    def test_every_optional_fetch_failure_is_explicitly_degraded(self):
+        def fail():
+            raise RuntimeError("HTTP 503")
+        for source in cqi.OPTIONAL_SOURCES:
+            fetchers = {k: (lambda frame=frame: frame) for k, frame in self.source_frames().items()}
+            fetchers[source] = fail
+            with self.subTest(source=source), patch.object(cqi, "FETCHERS", fetchers), patch.object(cqi, "annotate") as annotations:
+                self.assertEqual(cqi.main(["fetch"]), 0)
+                status = cqi.check_fetch_status()
+            self.assertEqual(status["status"], "degraded")
+            self.assertEqual(status["sources"][source]["status"], "failed")
+            self.assertEqual(status["sources"][source]["tier"], "optional")
+            self.assertIn("HTTP 503", status["sources"][source]["error"])
+            self.assertTrue(any(call.args[0] == "warning" and source in call.args[1] for call in annotations.call_args_list))
+            self.assertEqual(status["sources"]["trust"]["latest_observations"], {"DGS10": "2024-06-10", "DTWEXBGS": "2024-06-07"})
+
+    def test_every_core_fetch_failure_blocks_publication(self):
+        def fail():
+            raise RuntimeError("core unavailable")
+        target = cqi.OUT / "cqi_daily.csv"
+        target.parent.mkdir(parents=True)
+        target.write_text("previous verified reading")
+        for source in cqi.CORE_SOURCES:
+            fetchers = {k: (lambda frame=frame: frame) for k, frame in self.source_frames().items()}
+            fetchers[source] = fail
+            with self.subTest(source=source), patch.object(cqi, "FETCHERS", fetchers), patch.object(cqi, "cmd_build") as build:
+                self.assertEqual(cqi.main(["all"]), 1)
+                build.assert_not_called()
+            self.assertEqual(json.loads((cqi.RAW / "fetch_status.json").read_text())["status"], "failed")
+            self.assertEqual(json.loads((cqi.OUT / "build_status.json").read_text())["status"], "failed")
+            self.assertEqual(target.read_text(), "previous verified reading")
+
+    def test_inconsistent_or_incomplete_degraded_manifest_is_rejected(self):
+        for change in ("core_failed", "missing_optional", "invalid_optional", "hidden_failure", "false_degradation", "no_error", "invalid_time"):
+            status = self.manifest()
+            if change == "core_failed":
+                status["status"] = "degraded"
+                status["sources"]["trust"]["status"] = "failed"
+            elif change == "missing_optional":
+                del status["sources"]["repo_ops"]
+            elif change == "invalid_optional":
+                status["sources"]["repo_ops"]["status"] = "running"
+            elif change == "hidden_failure":
+                status["sources"]["repo_ops"] = {"status": "failed", "error": "network"}
+            elif change == "false_degradation":
+                status["status"] = "degraded"
+            elif change == "no_error":
+                status["status"] = "degraded"
+                status["sources"]["repo_ops"] = {"status": "failed"}
+            else:
+                status["completed_at"] = "NaT"
+            cqi.write_json(cqi.RAW / "fetch_status.json", status)
+            with self.subTest(change=change), self.assertRaises(cqi.PipelineError):
+                cqi.check_fetch_status()
+
+    def test_failed_optional_component_is_never_read_from_old_files(self):
+        funcs = {k: (lambda bdays: pd.Series(np.arange(len(bdays)), index=bdays)) for k in cqi.COMPONENTS}
+        with patch.object(cqi, "COMPONENTS", funcs), patch.dict(funcs, {"央行回购使用量": lambda bdays: self.fail("failed source read")}), \
+                patch.object(cqi, "rolling_z", new=lambda series: series):
+            result = cqi.build(ok_sources=set(cqi.FETCHERS) - {"repo_ops"})
+        self.assertNotIn("raw_央行回购使用量", result)
+        self.assertNotIn("z_央行回购使用量", result)
+        self.assertEqual(result["成分数"].iloc[-1], 5)
+
+    def test_optional_build_validation_failure_degrades_but_core_failure_stops(self):
+        def fail(_):
+            raise cqi.PipelineError("stale local input")
+        for component in ("央行回购使用量", "信任背离", "回购压力"):
+            funcs = {k: (lambda bdays: pd.Series(np.arange(len(bdays)), index=bdays)) for k in cqi.COMPONENTS}
+            funcs[component] = fail
+            with self.subTest(component=component), patch.object(cqi, "COMPONENTS", funcs), \
+                    patch.object(cqi, "rolling_z", new=lambda series: series):
+                if component != "央行回购使用量":
+                    with self.assertRaisesRegex(cqi.PipelineError, "stale local input"):
+                        cqi.build(ok_sources=set(cqi.FETCHERS))
+                else:
+                    self.manifest()
+                    out = cqi.cmd_build(None)
+                    status = json.loads((cqi.OUT / "build_status.json").read_text())
+                    self.assertEqual(status["status"], "degraded")
+                    self.assertEqual(status["sources"]["repo_ops"]["status"], "failed")
+                    self.assertEqual(status["sources"]["repo_ops"]["stage"], "build")
+                    self.assertNotIn("raw_央行回购使用量", out)
+
+    def test_degraded_build_discloses_status_in_manifest_and_standalone_csv(self):
+        status = self.manifest()
+        status["status"] = "degraded"
+        status["sources"]["cftc"] = {"status": "failed", "error": "HTTP 503", "tier": "optional"}
+        cqi.write_json(cqi.RAW / "fetch_status.json", status)
+        with patch.object(cqi, "build", return_value=self.output()) as build:
+            result = cqi.cmd_build(None)
+        self.assertNotIn("cftc", build.call_args.kwargs["ok_sources"])
+        status = json.loads((cqi.OUT / "build_status.json").read_text())
+        self.assertEqual(status["status"], "degraded")
+        self.assertEqual(status["missing_components"], ["基差平仓速度"])
+        self.assertEqual(result["data_status"].iloc[-1], "degraded")
+        output = pd.read_csv(cqi.OUT / "cqi_daily.csv")
+        self.assertEqual(output["run_status"].iloc[-1], "degraded")
+        self.assertEqual(output["missing_components"].iloc[-1], "基差平仓速度")
+        self.assertEqual(output["data_kind"].iloc[-1], "real")
+
+    def test_degraded_build_still_requires_three_components(self):
+        funcs = {k: (lambda bdays: pd.Series(np.arange(len(bdays)), index=bdays)) for k in cqi.COMPONENTS}
+        status = self.manifest()
+        status["status"] = "degraded"
+        for source in cqi.OPTIONAL_SOURCES:
+            status["sources"][source] = {"status": "failed", "error": "offline"}
+        cqi.write_json(cqi.RAW / "fetch_status.json", status)
+        with patch.object(cqi, "COMPONENTS", funcs), patch.object(cqi, "rolling_z", new=lambda series: series):
+            self.assertEqual(cqi.main(["build"]), 1)
+        self.assertFalse((cqi.OUT / "cqi_daily.csv").exists())
+
+    def test_degraded_backtest_never_claims_formal_pass(self):
+        out = self.output([2.0])
+        with patch.object(cqi, "EVENTS", {"event": "2024-06-10"}), patch.object(cqi, "MUST_FLAG", ["event"]), patch.object(cqi, "CALM", {}):
+            normal_md, normal_verdict = cqi.backtest(out)
+            md, verdict = cqi.backtest(out, missing_components=["基差平仓速度"], degraded=True)
+        self.assertEqual(normal_verdict, "通过")
+        self.assertIn("可提交卷六关口", normal_md)
+        self.assertNotEqual(verdict, "通过")
+        self.assertTrue(md.startswith("> **降级运行**"))
+        self.assertIn("基差平仓速度", md)
+        self.assertIn("不能作为第二阶段关口的正式依据", md)
+        self.assertNotIn("可提交卷六关口", md)
+
+    def test_backtest_command_propagates_degraded_state(self):
+        out = self.output()
+        out["data_kind"] = "real"
+        out["data_status"] = "degraded"
+        cqi.write_csv(cqi.OUT / "cqi_daily.csv", out, index_label="date")
+        cqi.write_json(cqi.OUT / "build_status.json", {"status": "degraded", "missing_components": ["央行回购使用量"]})
+        with patch.object(cqi, "backtest", return_value=("degraded report", "不作正式判定")) as backtest, \
+                patch.dict("sys.modules", {"matplotlib": None}):
+            self.assertEqual(cqi.main(["backtest"]), 1)  # Plot failure must remain an error.
+        self.assertEqual(backtest.call_args.kwargs, {"missing_components": ["央行回购使用量"], "degraded": True})
+
+    def test_annotations_escape_untrusted_message_text(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cqi.annotate("warning", "source,invalid:title\nnext", "HTTP 50%\n::error::injected")
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("source%2Cinvalid%3Atitle%0Anext", output.getvalue())
+        self.assertIn("50%25", output.getvalue())
 
     def test_buyback_known_schema_aliases_are_normalized(self):
         data = pd.DataFrame({"operation_date": ["2024-06-07"], "total_par_amt_offered": ["3,000"],
@@ -230,9 +454,15 @@ class CQITest(unittest.TestCase):
         self.assertEqual(json.loads((cqi.OUT / "build_status.json").read_text())["status"], "failed")
 
     def test_all_stops_after_failed_fetch(self):
-        with patch.object(cqi, "cmd_fetch", side_effect=cqi.PipelineError("broken")), patch.object(cqi, "cmd_build") as build:
+        with patch.object(cqi, "require_api_key"), patch.object(cqi, "cmd_fetch", side_effect=cqi.PipelineError("broken")) as fetch, patch.object(cqi, "cmd_build") as build:
             self.assertEqual(cqi.main(["all"]), 1)
+            fetch.assert_called_once()
             build.assert_not_called()
+
+    def test_missing_api_key_stops_cli_before_any_fetch(self):
+        with patch.object(cqi, "require_api_key", side_effect=cqi.FredAPIError("FRED_API_KEY missing")), patch.object(cqi, "cmd_fetch") as fetch:
+            self.assertEqual(cqi.main(["all"]), 1)
+            fetch.assert_not_called()
 
     def test_missing_fetch_manifest_fails_build(self):
         self.assertEqual(cqi.main(["build"]), 1)

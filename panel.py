@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from fred_api import FredAPIError, fetch_series, require_api_key
 
 ROOT = Path(__file__).resolve().parent
 RAW = ROOT / "data" / "raw" / "fred"
@@ -28,7 +29,6 @@ OUT = ROOT / "data"
 REP = ROOT / "reports"
 START = "2015-01-01"
 END = date.today().isoformat()
-FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
 
 # ───────────── FRED 序列（名称：序列代码）─────────────
 SERIES = {
@@ -68,28 +68,16 @@ SIG2_DAYS = 20       # 相关性连续为正多少个交易日视为“持续”
 SIG3_WIN = 126       # 同跌统计窗口（约 6 个月）
 
 
-def get_csv(url, retries=3):
-    import requests
-    for i in range(retries):
-        try:
-            r = requests.get(url, timeout=60, headers={"User-Agent": "HQ-Research-Panel/0.1"})
-            r.raise_for_status()
-            return pd.read_csv(io.BytesIO(r.content))
-        except Exception:
-            if i == retries - 1:
-                raise
-            time.sleep(2 * (i + 1))
-
 
 def cmd_fetch(_):
     RAW.mkdir(parents=True, exist_ok=True)
     failures = []
     for name, sid in SERIES.items():
         try:
-            df = get_csv(FRED.format(sid=sid) + f"&cosd={START}&coed={END}")
-            if df.shape[1] != 2:
-                raise ValueError("FRED 响应必须含日期和一个序列")
-            df.columns = ["date", name]
+            df = fetch_series(sid, START, END)
+            if not {"date", "value"}.issubset(df.columns):
+                raise ValueError("FRED API 响应缺少 date/value")
+            df = df[["date", "value"]].rename(columns={"value": name})
             df["date"] = pd.to_datetime(df["date"], errors="raise")
             df[name] = pd.to_numeric(df[name], errors="coerce")
             if df[name].notna().sum() == 0:
@@ -98,7 +86,9 @@ def cmd_fetch(_):
             print(f"[完成] {name:12s} {sid:14s} {len(df)} 行")
         except Exception as ex:
             failures.append(name)
-            print(f"[失败] {name:12s} {sid:14s} {ex}")
+            detail = str(ex) if isinstance(ex, FredAPIError) else "FRED API response validation failed"
+            print(f"[失败] {name:12s} {sid:14s} {detail}")
+            print(f"::warning title=面板序列失败 {name}::{sid} " + " ".join(detail.split())[:600].replace("%", "%25"), flush=True)
     if failures:
         raise RuntimeError("FRED 抓取未完成，停止生成，避免沿用旧数据：" + ", ".join(failures))
 
@@ -188,11 +178,15 @@ def build(f):
     panel = f.join(sig)
     if "sofr" in f and "iorb" in f:
         panel["sofr_minus_iorb_bp"] = (f["sofr"] - f["iorb"]) * 100
+    cqi_status = {}
     cqi_p = OUT / "cqi_daily.csv"
     if cqi_p.exists():
         status_path = OUT / "build_status.json"
-        if not status_path.exists() or json.loads(status_path.read_text(encoding="utf-8")).get("status") != "ok":
+        cqi_status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+        if cqi_status.get("status") not in {"ok", "degraded"}:
             raise ValueError("CQI 最新构建未通过；请先运行 cqi.py all，不能沿用旧结果")
+        if cqi_status.get("status") == "degraded" and not cqi_status.get("missing_components"):
+            raise ValueError("CQI 降级状态缺少明确缺失成分，不能发布")
         cqi = pd.read_csv(cqi_p, index_col=0, parse_dates=True)
         if "data_kind" not in cqi or not cqi["data_kind"].eq("real").all():
             raise ValueError("CQI 缺少真实数据标记或为合成数据；请先运行 cqi.py all")
@@ -202,6 +196,7 @@ def build(f):
         cqi = cqi[["cqi", "灯"]]
         panel = panel.join(cqi.rename(columns={"灯": "cqi_lamp"}))
     panel.attrs["observed"] = f.attrs.get("observed", {})
+    panel.attrs["cqi_status"] = cqi_status
     return panel
 
 
@@ -223,6 +218,11 @@ def report(panel):
         return observed.get(key, fallback)
     L = ["# 判决面板 · 全链数据版", "",
          f"生成时间：{date.today().isoformat()}；日频读数截至各序列最新可得日。阈值继承美债体系卷五，待卷六回测校准。", ""]
+
+    cqi_status = panel.attrs.get("cqi_status", {})
+    if cqi_status.get("status") == "degraded":
+        missing = "、".join(cqi_status["missing_components"])
+        L += [f"> **CQI 降级运行**：缺失成分 {missing}；未沿用失败来源的旧数据。相关回测不能作为正式关口依据。", ""]
 
     # 三边
     L += ["## 三边相变信号", "", "| 边 | 信号 | 当期读数 | 状态 |", "| --- | --- | --- | --- |"]
@@ -364,10 +364,17 @@ def main():
     ap = argparse.ArgumentParser(description="判决面板 · 全链管线")
     ap.add_argument("cmd", choices=["fetch", "build", "all", "demo"])
     a = ap.parse_args()
-    if a.cmd == "all":
-        cmd_fetch(a); cmd_build(a)
-    else:
-        {"fetch": cmd_fetch, "build": cmd_build, "demo": cmd_demo}[a.cmd](a)
+    try:
+        if a.cmd in {"fetch", "all"}:
+            require_api_key()
+        if a.cmd == "all":
+            cmd_fetch(a); cmd_build(a)
+        else:
+            {"fetch": cmd_fetch, "build": cmd_build, "demo": cmd_demo}[a.cmd](a)
+    except Exception as ex:
+        msg = " ".join(str(ex).split())[:900].replace("%", "%25")
+        print(f"::error title=Panel {a.cmd} 失败::{msg}", flush=True)
+        raise
 
 
 if __name__ == "__main__":

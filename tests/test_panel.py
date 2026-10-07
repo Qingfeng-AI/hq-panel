@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -7,13 +9,18 @@ import pandas as pd
 import panel
 
 class PanelTests(unittest.TestCase):
+    def setUp(self):
+        output = contextlib.redirect_stdout(io.StringIO())
+        output.__enter__()
+        self.addCleanup(output.__exit__, None, None, None)
+
     def test_missing_input_is_error(self):
         with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)):
             with self.assertRaisesRegex(ValueError, "缺失"):
                 panel.load_fred()
 
     def test_failed_fetch_is_error(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "get_csv", side_effect=RuntimeError("offline")):
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "fetch_series", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
                 panel.cmd_fetch(None)
 
@@ -49,6 +56,22 @@ class PanelTests(unittest.TestCase):
             self.assertIn("0.10 | 2026-10-06 | —", panel.report(frame))
 
     def test_fred_fetch_requests_only_model_date_range(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "get_csv", return_value=pd.DataFrame({"observation_date": ["2026-10-05"], "DGS10": [4.2]})) as get:
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "fetch_series", return_value=pd.DataFrame({"date": ["2026-10-05"], "value": [4.2]})) as get:
             panel.cmd_fetch(None)
-            self.assertIn("&cosd=" + panel.START + "&coed=" + panel.END, get.call_args.args[0])
+            self.assertEqual(get.call_args.args, ("DGS10", panel.START, panel.END))
+
+    def test_fred_errors_do_not_expose_raw_request_details(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "fetch_series", side_effect=RuntimeError("private request details")):
+            with contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(RuntimeError) as error:
+                panel.cmd_fetch(None)
+            self.assertNotIn("private request details", output.getvalue() + str(error.exception))
+
+    def test_degraded_cqi_is_accepted_and_disclosed(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "OUT", Path(root)), patch.object(panel, "MAN", Path(root)), patch.object(panel, "END", "2026-10-07"):
+            pd.DataFrame({"date": ["2026-10-06"], "cqi": [0.1], "灯": [""], "data_kind": ["real"]}).set_index("date").to_csv(Path(root) / "cqi_daily.csv")
+            (Path(root) / "build_status.json").write_text(json.dumps({"status": "degraded", "missing_components": ["基差平仓速度"]}))
+            frame = panel.build(pd.DataFrame(index=pd.bdate_range("2026-10-01", periods=5)))
+            text = panel.report(frame)
+            self.assertIn("CQI 降级运行", text)
+            self.assertIn("基差平仓速度", text)
+            self.assertIn("不能作为正式关口依据", text)

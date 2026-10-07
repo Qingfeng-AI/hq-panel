@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 抵押品质量指数（公开版）数据管线
-HQ Research · 美债体系卷六 · V0.1
+HQ Research · 美债体系卷六 · V0.3
 
 子命令：
-  probe     逐一探测五个数据源，打印字段，确认接口可用
+  probe     逐一探测七组数据源，打印字段，确认接口可用
   fetch     抓取原始数据到 data/raw/
-  build     计算五个成分、标准化、合成指数，输出 data/cqi_daily.csv
+  build     计算六个成分、标准化、合成指数，输出 data/cqi_daily.csv
   backtest  按卷六第二节的标准回测，输出 reports/backtest.md
   all       fetch + build + backtest
   demo      用合成数据跑通 build + backtest（不联网，用于检查管线本身）
@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
+from fred_api import FredAPIError, fetch_series, require_api_key
 
 ROOT = Path(__file__).resolve().parent
 RAW = ROOT / "data" / "raw"
@@ -38,7 +39,6 @@ MIN_COMPONENTS = 3               # 合成至少需要 3 个成分有读数
 URL = {
     "sofr": "https://markets.newyorkfed.org/api/rates/secured/sofr/search.json?startDate={s}&endDate={e}",
     "repo_ops": "https://markets.newyorkfed.org/api/rp/results/search.json?startDate={s}&endDate={e}",
-    "fred_csv": "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}",
     "auctions": ("https://www.treasurydirect.gov/TA_WS/securities/search?startDate={s}&endDate={e}"
                  "&dateFieldName=auctionDate&compact=false&format=json"),
     "buybacks": ("https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
@@ -61,13 +61,33 @@ MUST_FLAG = ["2019-09 回购利率飙升", "2020-03 现金争夺", "2025-04 关�
 CALM = {"2021 全年": ("2021-01-01", "2021-12-31"), "2024 上半年": ("2024-01-01", "2024-06-30")}
 CALM_MAX_SHARE = 0.10            # 平静期亮黄灯的天数占比上限
 
-UA = {"User-Agent": "HQ-Research-CQI/0.1 (research pipeline)"}
+UA = {"User-Agent": "HQ-Research-CQI/0.3 (research pipeline)"}
 
 # Calendar-day allowances accommodate weekends/publication lags, not unlimited carry-forward.
-SOURCE_FILES = {"sofr": "sofr", "admin_rate": "admin_rate", "repo_ops": "repo_ops",
+SOURCE_FILES = {"sofr": "sofr", "admin_rate": "admin_rate", "trust": "trust", "repo_ops": "repo_ops",
                 "auctions": "auctions", "buybacks": "buybacks", "cftc": "cftc_tff"}
-SOURCE_MAX_AGE_DAYS = {"sofr": 7, "admin_rate": 7, "repo_ops": 7,
+SOURCE_MAX_AGE_DAYS = {"sofr": 7, "admin_rate": 7, "trust": 10, "repo_ops": 7,
                        "auctions": 45, "buybacks": 45, "cftc": 14}
+
+# V0.3：核心来源必须全部成功，否则任务失败、不发布；可选来源失败时进入“降级”状态，
+# 对应成分不参与合成（绝不沿用旧数据），并在报告与运行页面上明确标出。
+CORE_SOURCES = ("sofr", "admin_rate", "trust")
+OPTIONAL_SOURCES = ("repo_ops", "auctions", "buybacks", "cftc")
+COMPONENT_SOURCES = {
+    "回购压力": ("sofr", "admin_rate"),
+    "央行回购使用量": ("repo_ops",),
+    "拍卖吸收度": ("auctions",),
+    "回购卖压": ("buybacks",),
+    "基差平仓速度": ("cftc",),
+    "信任背离": ("trust",),
+}
+
+
+def annotate(level, title, message):
+    """在 GitHub Actions 运行页面生成公开可见的注释；本地运行时只是普通输出。"""
+    msg = " ".join(str(message).split())[:900].replace("%", "%25")
+    title = str(title).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A").replace(":", "%3A").replace(",", "%2C")
+    print(f"::{level} title={title}::{msg}", flush=True)
 
 
 class PipelineError(RuntimeError):
@@ -146,6 +166,8 @@ def validate_source(source, df, check_freshness=True):
         required, numeric = [date_col, "total_offered", "total_accepted"], ["total_offered", "total_accepted"]
     elif source == "cftc":
         required, numeric = ["market", "date", "lev_short", "lev_long"], ["lev_short", "lev_long"]
+    elif source == "trust":
+        required, numeric = ["date", "value", "series"], ["value"]
     else:
         raise PipelineError(f"unknown source: {source}")
     require_columns(df, required, source)
@@ -156,7 +178,12 @@ def validate_source(source, df, check_freshness=True):
     df = df.loc[df[date_col] <= pd.Timestamp(END)].copy()
     for c in numeric:
         df[c] = num(df[c]).replace([np.inf, -np.inf], np.nan)
-    if source == "admin_rate":
+    if source == "trust":
+        df = df.dropna(subset=numeric)
+        if not {"DGS10", "DTWEXBGS"}.issubset(set(df["series"])):
+            raise PipelineError("trust: both DGS10 and DTWEXBGS history are required")
+        usable = df
+    elif source == "admin_rate":
         df = df.dropna(subset=numeric)
         if not {"IOER", "IORB"}.issubset(set(df["series"])):
             raise PipelineError("admin_rate: both IOER and IORB history are required")
@@ -192,15 +219,23 @@ def validate_source(source, df, check_freshness=True):
     if usable.empty:
         raise PipelineError(f"{source}: no usable observations")
     latest = usable[date_col].max()
+    if source == "trust":
+        # A fresh series must never hide a stale counterpart needed by the signal.
+        latest_by_series = usable.groupby("series")[date_col].max().loc[["DGS10", "DTWEXBGS"]]
+        for sid, observation in latest_by_series.items():
+            series_age = (pd.Timestamp(END) - observation).days
+            if check_freshness and series_age > SOURCE_MAX_AGE_DAYS[source]:
+                raise PipelineError(f"trust: {sid} stale observations (latest {observation.date()}, {series_age} calendar days old)")
+        latest = latest_by_series.min()
     age = (pd.Timestamp(END) - latest).days
     if check_freshness and age > SOURCE_MAX_AGE_DAYS[source]:
         raise PipelineError(f"{source}: stale observations (latest {latest.date()}, {age} calendar days old)")
     keys = [date_col]
-    if source == "admin_rate":
+    if source in {"admin_rate", "trust"}:
         keys += ["series"]
     elif source == "cftc":
         keys += ["market"]
-    if source in {"sofr", "admin_rate", "cftc"}:
+    if source in {"sofr", "admin_rate", "cftc", "trust"}:
         if df.drop_duplicates().duplicated(keys).any():
             raise PipelineError(f"{source}: conflicting duplicate observations")
         df = df.drop_duplicates(keys)
@@ -276,20 +311,35 @@ def fetch_sofr():
     return save_source("sofr", df)
 
 
+def fred_frame(sid, start, end):
+    try:
+        frame = fetch_series(sid, start, end)
+    except FredAPIError as ex:
+        raise PipelineError(str(ex)) from None
+    except Exception:
+        raise PipelineError(f"{sid}: FRED API request failed") from None
+    require_columns(frame, ["date", "value"], sid)
+    return frame[["date", "value"]].copy()
+
+
 def fetch_admin_rate():
     frames = []
     for sid in ("IOER", "IORB"):
         end = min(END, "2021-07-28") if sid == "IOER" else END
-        url = URL["fred_csv"].format(sid=sid) + "&" + urlencode({"cosd": START, "coed": end})
-        raw = get(url, as_json=False)
-        d = pd.read_csv(io.BytesIO(raw))
-        d.columns = d.columns.str.strip()
-        date_col = pick_column(d, ["observation_date", "DATE", "date"], sid, "observation date")
-        require_columns(d, [date_col, sid], sid)
-        d = d[[date_col, sid]].rename(columns={date_col: "date", sid: "rate"})
+        d = fred_frame(sid, START, end).rename(columns={"value": "rate"})
         d["series"] = sid
         frames.append(d)
     return save_source("admin_rate", pd.concat(frames, ignore_index=True))
+
+
+def fetch_trust():
+    """V0.3 信任背离输入，使用官方 FRED observations API。"""
+    frames = []
+    for sid in ("DGS10", "DTWEXBGS"):
+        d = fred_frame(sid, START, END)
+        d["series"] = sid
+        frames.append(d)
+    return save_source("trust", pd.concat(frames, ignore_index=True))
 
 
 def fetch_repo_ops():
@@ -426,7 +476,7 @@ def fetch_cftc():
         raise PipelineError(f"CFTC API: {ex}") from ex
 
 
-FETCHERS = {"sofr": fetch_sofr, "admin_rate": fetch_admin_rate, "repo_ops": fetch_repo_ops,
+FETCHERS = {"sofr": fetch_sofr, "admin_rate": fetch_admin_rate, "trust": fetch_trust, "repo_ops": fetch_repo_ops,
             "auctions": fetch_auctions, "buybacks": fetch_buybacks, "cftc": fetch_cftc}
 
 
@@ -436,23 +486,37 @@ def cmd_fetch(_):
     write_json(RAW / "fetch_status.json", status)
     # Invalidate a prior success before touching any input files.
     write_json(OUT / "build_status.json", {"status": "pending", "generated_at": utc_now(), "as_of": END})
-    failures = []
+    failures, degraded = [], []
     for k, f in FETCHERS.items():
         print(f"抓取 {k} …")
+        tier = "core" if k in CORE_SOURCES else "optional"
         try:
             df = f()
             _, latest = validate_source(k, df)
-            status["sources"][k] = {"status": "ok", "rows": len(df), "latest_observation": latest}
+            status["sources"][k] = {"status": "ok", "tier": tier, "rows": len(df), "latest_observation": latest}
+            if k == "trust":
+                status["sources"][k]["latest_observations"] = {
+                    sid: value.date().isoformat()
+                    for sid, value in df.assign(date=pd.to_datetime(df["date"])).groupby("series")["date"].max().items()
+                }
             print(f"  完成：{len(df)} 行")
+            observations = status["sources"][k].get("latest_observations", latest)
+            annotate("notice", f"来源成功 {k}", f"{len(df)} 行；最新原始观测：{observations}")
         except Exception as ex:
-            failures.append(f"{k}: {ex}")
-            status["sources"][k] = {"status": "failed", "error": str(ex)}
+            status["sources"][k] = {"status": "failed", "tier": tier, "error": str(ex)}
             print(f"  失败：{ex}", file=sys.stderr)
+            if tier == "core":
+                failures.append(f"{k}: {ex}")
+                annotate("error", f"核心来源失败 {k}", ex)
+            else:
+                degraded.append(f"{k}: {ex}")
+                annotate("warning", f"可选来源失败 {k}（降级运行）", ex)
         write_json(RAW / "fetch_status.json", status)
-    status.update(status="failed" if failures else "ok", completed_at=utc_now())
+    status.update(status="failed" if failures else ("degraded" if degraded else "ok"),
+                  completed_at=utc_now(), degraded=degraded)
     write_json(RAW / "fetch_status.json", status)
     if failures:
-        message = "抓取失败；未发布新的真实 CQI。 " + "; ".join(failures)
+        message = "核心来源抓取失败；未发布新的真实 CQI。 " + "; ".join(failures)
         write_json(OUT / "build_status.json", {"status": "failed", "generated_at": utc_now(), "as_of": END, "error": message})
         raise PipelineError(message)
     return status
@@ -461,7 +525,8 @@ def cmd_fetch(_):
 def cmd_probe(_):
     tests = {
         "sofr": lambda: get(URL["sofr"].format(s="2026-09-01", e="2026-09-05")),
-        "admin_rate": lambda: get(URL["fred_csv"].format(sid="IORB"), as_json=False)[:200],
+        "admin_rate": lambda: fred_frame("IORB", START, END).tail(2).astype(str).to_dict("records"),
+        "trust": lambda: {sid: fred_frame(sid, START, END).tail(2).astype(str).to_dict("records") for sid in ("DGS10", "DTWEXBGS")},
         "repo_ops": lambda: get(URL["repo_ops"].format(s="2025-12-29", e="2025-12-31")),
         "auctions": lambda: get(URL["auctions"].format(s="2026-08-10", e="2026-08-14")),
         "buybacks": lambda: get(URL["buybacks"].replace("page[size]=10000", "page[size]=2")),
@@ -574,23 +639,58 @@ def comp_basis_unwind(bdays):
     return unwind.reindex(bdays).ffill(limit=7)
 
 
+def comp_trust_divergence(bdays):
+    """信任背离：10 年期收益率 5 日上行且广义美元指数 5 日下跌时，取上行幅度（基点），否则为 0。
+    事件级验证发现 2025 年 4 月的压力体现为“收益率上行而美元下跌”，使用压力类成分捕捉不到。"""
+    t = read("trust")
+    y = t.loc[t["series"].eq("DGS10")].set_index("date")["value"]
+    usd = t.loc[t["series"].eq("DTWEXBGS")].set_index("date")["value"]
+    y.index = pd.to_datetime(y.index)
+    usd.index = pd.to_datetime(usd.index)
+    y = y.reindex(bdays.union(y.index).sort_values()).ffill(limit=5).reindex(bdays)
+    usd = usd.reindex(bdays.union(usd.index).sort_values()).ffill(limit=5).reindex(bdays)
+    dy = y.diff(5) * 100
+    dusd = usd.pct_change(5, fill_method=None)
+    out = dy.where((dy > 0) & (dusd < 0), 0.0)
+    return out.where(dy.notna() & dusd.notna())
+
+
 COMPONENTS = {
     "回购压力": comp_repo_pressure,
     "央行回购使用量": comp_srp_usage,
     "拍卖吸收度": comp_auction_absorption,
     "回购卖压": comp_buyback_pressure,
     "基差平仓速度": comp_basis_unwind,
+    "信任背离": comp_trust_divergence,
 }
 
 
-def build(raw_components=None):
+def build(raw_components=None, ok_sources=None):
     bdays = pd.bdate_range(START, END)
+    source_errors = {}
     if raw_components is None:
+        if ok_sources is not None and not set(CORE_SOURCES).issubset(ok_sources):
+            raise PipelineError("cannot build without every core source")
         raw_components = {}
         for k, f in COMPONENTS.items():
-            s = f(bdays)
-            if s is None:
-                print(f"  成分缺失：{k}")
+            if ok_sources is not None and not all(src in ok_sources for src in COMPONENT_SOURCES[k]):
+                print(f"  成分缺失（来源失败，不使用旧数据）：{k}")
+                raw_components[k] = None
+                continue
+            try:
+                s = f(bdays)
+                if s is None:
+                    raise PipelineError(f"{k}: no component input")
+            except PipelineError as ex:
+                sources = COMPONENT_SOURCES[k]
+                if any(src in CORE_SOURCES for src in sources):
+                    raise
+                # Revalidation can fail after fetch (e.g. stale/corrupt local input).
+                # Exclude the complete failed component; never reuse its old values.
+                for source in sources:
+                    source_errors[source] = str(ex)
+                annotate("warning", f"可选成分失败 {k}（降级运行）", ex)
+                s = None
             raw_components[k] = s
     comp = pd.DataFrame({k: v for k, v in raw_components.items() if v is not None}, index=bdays)
     comp = comp.replace([np.inf, -np.inf], np.nan)
@@ -608,6 +708,7 @@ def build(raw_components=None):
     out.loc[out["cqi"].isna(), "灯"] = "数据缺失"
     out["data_status"] = np.where(out["cqi"].notna(), "ok", "insufficient_components")
     out = out.join(z.add_prefix("z_")).join(comp.add_prefix("raw_"))
+    out.attrs["source_errors"] = source_errors
     return out
 
 
@@ -620,10 +721,19 @@ def check_fetch_status():
         completed = pd.Timestamp(status["completed_at"])
     except (ValueError, KeyError, TypeError) as ex:
         raise PipelineError("invalid or incomplete fetch manifest; run fetch") from ex
-    if status.get("status") != "ok" or any(status.get("sources", {}).get(k, {}).get("status") != "ok" for k in FETCHERS):
-        raise PipelineError("latest fetch did not succeed for every source; run fetch")
+    srcs = status.get("sources", {})
+    if status.get("status") not in ("ok", "degraded") or any(srcs.get(k, {}).get("status") != "ok" for k in CORE_SOURCES):
+        raise PipelineError("latest fetch did not succeed for every core source; run fetch")
+    if any(k not in srcs for k in FETCHERS):
+        raise PipelineError("invalid or incomplete fetch manifest; run fetch")
+    if any(not isinstance(srcs[k], dict) or srcs[k].get("status") not in ("ok", "failed") for k in FETCHERS):
+        raise PipelineError("invalid or incomplete source status; run fetch")
+    failed_optional = [k for k in OPTIONAL_SOURCES if srcs[k]["status"] == "failed"]
+    if ((status["status"] == "degraded") != bool(failed_optional)
+            or any(not srcs[k].get("error") for k in failed_optional)):
+        raise PipelineError("inconsistent fetch degradation status; run fetch")
     now = pd.Timestamp.now(tz="UTC")
-    if completed.tzinfo is None or completed > now + pd.Timedelta(minutes=5) or now - completed > pd.Timedelta(days=3):
+    if pd.isna(completed) or completed.tzinfo is None or completed > now + pd.Timedelta(minutes=5) or now - completed > pd.Timedelta(days=3):
         raise PipelineError("fetch manifest is stale or has an invalid timestamp; run fetch")
     return status
 
@@ -634,18 +744,33 @@ def cmd_build(_):
     write_json(OUT / "build_status.json", status)
     try:
         fetch_status = check_fetch_status()
-        out = build()
+        ok_sources = {k for k, v in fetch_status.get("sources", {}).items() if v.get("status") == "ok"}
+        out = build(ok_sources=ok_sources)
         if out.empty or out["cqi"].dropna().empty:
             raise PipelineError("no usable CQI: insufficient components or standardization history")
         if pd.isna(out["cqi"].iloc[-1]) or not np.isfinite(out["cqi"].iloc[-1]):
             raise PipelineError("latest business day has no usable CQI; refusing to publish an old reading as current")
+        if out["成分数"].iloc[-1] < MIN_COMPONENTS:
+            raise PipelineError("latest business day has fewer than the minimum components")
+        for source, error in out.attrs.get("source_errors", {}).items():
+            ok_sources.discard(source)
+            fetch_status["sources"][source] = {"status": "failed", "tier": "optional", "stage": "build", "error": error}
         out["data_kind"] = "real"
+        missing = [k for k, srcs in COMPONENT_SOURCES.items() if not all(x in ok_sources for x in srcs)]
+        state = "degraded" if missing else "ok"
+        out.loc[out["cqi"].notna(), "data_status"] = state
+        out["run_status"] = state
+        out["missing_components"] = "、".join(missing)
         write_csv(OUT / "cqi_daily.csv", out, encoding="utf-8-sig", index_label="date")
-        status.update(status="ok", generated_at=utc_now(), latest_cqi_date=out.index[-1].date().isoformat(),
-                      component_count=int(out["成分数"].iloc[-1]), sources=fetch_status["sources"])
+        status.update(status=state, generated_at=utc_now(), latest_cqi_date=out.index[-1].date().isoformat(),
+                      component_count=int(out["成分数"].iloc[-1]), missing_components=missing,
+                      sources=fetch_status["sources"])
         write_json(OUT / "build_status.json", status)
         r = out.iloc[-1]
         print(f"最新读数 {out.index[-1].date()}：CQI = {r.cqi:.2f}  灯：{r['灯'] or '无'}  成分数：{r['成分数']}")
+        if missing:
+            annotate("warning", "CQI 降级运行", "缺失成分：" + "、".join(missing) + "；其余成分照常合成")
+        annotate("notice", "CQI 最新读数", f"{out.index[-1].date()} CQI={r.cqi:.2f} 灯={r['灯'] or '无'} 成分数={r['成分数']}")
         return out
     except Exception as ex:
         status.update(status="failed", generated_at=utc_now(), error=str(ex))
@@ -654,7 +779,9 @@ def cmd_build(_):
 
 
 # ───────────────────────── 回测 ─────────────────────────
-def backtest(out):
+def backtest(out, missing_components=None, degraded=False):
+    missing_components = missing_components or []
+    degraded = degraded or bool(missing_components)
     lines = ["# 抵押品质量指数（公开版）回测报告", "",
              f"阈值：黄灯 ≥ {YELLOW}，红灯 ≥ {RED}；标准化窗口 {Z_WINDOW} 个交易日。", "",
              "## 压力事件", "", "| 事件 | 窗口内最高 CQI | 灯 | 首次亮灯日 | 主要贡献成分 |", "| --- | --- | --- | --- | --- |"]
@@ -684,10 +811,17 @@ def backtest(out):
         calm_ok &= ok
         lines.append(f"| {name} | {share:.1%} | {'合格' if ok else '不合格'} |")
     must_ok = all(passed_events.get(k, False) for k in MUST_FLAG)
-    verdict = "通过" if (must_ok and calm_ok) else "未通过"
+    diagnostic_verdict = "通过" if (must_ok and calm_ok) else "未通过"
+    verdict = "不作正式判定（降级运行）" if degraded else diagnostic_verdict
+    conclusion = (f"**降级回测：现有成分指标{diagnostic_verdict}。**不能作为第二阶段关口的正式依据。" if degraded else
+                  f"**回测{verdict}。**" + ("可提交卷六关口。" if verdict == "通过" else "请调整权重或阈值后重跑，并在卷六登记调整。"))
     lines += ["", "## 结论", "",
               f"必须识别的三次事件：{'全部亮灯' if must_ok else '未全部亮灯'}；平静期误报：{'合格' if calm_ok else '不合格'}。",
-              f"**回测{verdict}。**" + ("可提交卷六关口。" if verdict == "通过" else "请调整权重或阈值后重跑，并在卷六登记调整。"), ""]
+              conclusion, ""]
+    if degraded:
+        missing = "、".join(missing_components) or "来源异常（详见生成状态）"
+        lines = ["> **降级运行**：本次缺失成分 " + missing
+                 + "（来源失败，未使用旧数据）。回测结论仅对现有成分有效，不能作为第二阶段关口的正式依据。", ""] + lines
     return "\n".join(lines), verdict
 
 
@@ -699,11 +833,16 @@ def cmd_backtest(_):
     if "data_kind" not in out or not out["data_kind"].eq("real").all():
         raise PipelineError("backtest requires verified real CQI data; use demo for synthetic data")
     status_path = OUT / "build_status.json"
-    if not status_path.exists() or json.loads(status_path.read_text(encoding="utf-8")).get("status") != "ok":
+    build_status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+    if build_status.get("status") not in ("ok", "degraded"):
         raise PipelineError("latest real build did not succeed; run build before backtest")
-    md, verdict = backtest(out)
+    degraded = build_status["status"] == "degraded"
+    if not degraded and "data_status" in out and out["data_status"].eq("degraded").any():
+        raise PipelineError("inconsistent build degradation status; run build before backtest")
+    md, verdict = backtest(out, missing_components=build_status.get("missing_components"), degraded=degraded)
+    annotate("notice", "CQI 回测结论", verdict)
     REP.mkdir(parents=True, exist_ok=True)
-    (REP / "backtest.md").write_text(md, encoding="utf-8")
+    atomic_write(REP / "backtest.md", lambda p: p.write_text(md, encoding="utf-8"))
     print(md)
     try:
         import matplotlib
@@ -715,9 +854,10 @@ def cmd_backtest(_):
         ax.axhline(RED, ls="--", lw=0.8)
         for d in EVENTS.values():
             ax.axvline(pd.Timestamp(d), lw=0.5, alpha=0.4)
-        ax.set_title("Collateral Quality Index (public version)")
+        ax.set_title("Collateral Quality Index (public version)" + (" - DEGRADED" if degraded else ""))
         fig.tight_layout()
         fig.savefig(REP / "cqi.png", dpi=150)
+        plt.close(fig)
     except Exception as ex:
         raise PipelineError(f"backtest plot generation failed: {ex}") from ex
 
@@ -748,6 +888,8 @@ def main(argv=None):
     ap.add_argument("cmd", choices=["probe", "fetch", "build", "backtest", "all", "demo"])
     a = ap.parse_args(argv)
     try:
+        if a.cmd in {"fetch", "all", "probe"}:
+            require_api_key()
         if a.cmd == "all":
             cmd_fetch(a); cmd_build(a); cmd_backtest(a)
         else:
@@ -755,6 +897,7 @@ def main(argv=None):
              "backtest": cmd_backtest, "demo": cmd_demo}[a.cmd](a)
     except Exception as ex:
         print(f"[失败] {ex}", file=sys.stderr)
+        annotate("error", f"CQI {a.cmd} 失败", ex)
         return 1
     return 0
 
