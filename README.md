@@ -4,7 +4,7 @@ HQ 判决面板与抵押品质量指数（CQI）的公开数据管线。无需 A
 
 ## 本地运行
 
-Python 3.11：
+Python 3.12（与验证环境一致）：
 ```sh
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
