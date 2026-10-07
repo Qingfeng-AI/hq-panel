@@ -52,3 +52,22 @@ class PanelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "get_csv", return_value=pd.DataFrame({"observation_date": ["2026-10-05"], "DGS10": [4.2]})) as get:
             panel.cmd_fetch(None)
             self.assertIn("&cosd=" + panel.START + "&coed=" + panel.END, get.call_args.args[0])
+
+    def test_fred_csv_uses_standard_https_client(self):
+        from unittest.mock import MagicMock
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"observation_date,DGS10\n2026-10-05,4.2\n"
+        with patch("urllib.request.urlopen", return_value=response) as call:
+            frame = panel.get_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
+            self.assertEqual(frame.iloc[0]["DGS10"], 4.2)
+            self.assertEqual(call.call_args.kwargs["timeout"], 60)
+
+    def test_degraded_cqi_is_accepted_and_disclosed(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "OUT", Path(root)), patch.object(panel, "MAN", Path(root)), patch.object(panel, "END", "2026-10-07"):
+            pd.DataFrame({"date": ["2026-10-06"], "cqi": [0.1], "灯": [""], "data_kind": ["real"]}).set_index("date").to_csv(Path(root) / "cqi_daily.csv")
+            (Path(root) / "build_status.json").write_text(json.dumps({"status": "degraded", "missing_components": ["基差平仓速度"]}))
+            frame = panel.build(pd.DataFrame(index=pd.bdate_range("2026-10-01", periods=5)))
+            text = panel.report(frame)
+            self.assertIn("CQI 降级运行", text)
+            self.assertIn("基差平仓速度", text)
+            self.assertIn("不能作为正式关口依据", text)

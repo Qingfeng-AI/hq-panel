@@ -9,6 +9,8 @@ on:
       - "requirements.txt"
       - "tests/**"
       - ".github/workflows/daily.yml"
+env:
+  PYTHONUNBUFFERED: "1"
 permissions:
   contents: read
 concurrency:

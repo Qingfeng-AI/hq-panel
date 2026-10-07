@@ -69,12 +69,11 @@ SIG3_WIN = 126       # 同跌统计窗口（约 6 个月）
 
 
 def get_csv(url, retries=3):
-    import requests
+    from urllib.request import Request, urlopen
     for i in range(retries):
         try:
-            r = requests.get(url, timeout=60, headers={"User-Agent": "HQ-Research-Panel/0.1"})
-            r.raise_for_status()
-            return pd.read_csv(io.BytesIO(r.content))
+            with urlopen(Request(url, headers={"User-Agent": "HQ-Research-Panel/0.1"}), timeout=60) as response:
+                return pd.read_csv(io.BytesIO(response.read()))
         except Exception:
             if i == retries - 1:
                 raise
@@ -99,6 +98,7 @@ def cmd_fetch(_):
         except Exception as ex:
             failures.append(name)
             print(f"[失败] {name:12s} {sid:14s} {ex}")
+            print(f"::warning title=面板序列失败 {name}::{sid} " + " ".join(str(ex).split())[:600].replace("%", "%25"), flush=True)
     if failures:
         raise RuntimeError("FRED 抓取未完成，停止生成，避免沿用旧数据：" + ", ".join(failures))
 
@@ -188,11 +188,15 @@ def build(f):
     panel = f.join(sig)
     if "sofr" in f and "iorb" in f:
         panel["sofr_minus_iorb_bp"] = (f["sofr"] - f["iorb"]) * 100
+    cqi_status = {}
     cqi_p = OUT / "cqi_daily.csv"
     if cqi_p.exists():
         status_path = OUT / "build_status.json"
-        if not status_path.exists() or json.loads(status_path.read_text(encoding="utf-8")).get("status") != "ok":
+        cqi_status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+        if cqi_status.get("status") not in {"ok", "degraded"}:
             raise ValueError("CQI 最新构建未通过；请先运行 cqi.py all，不能沿用旧结果")
+        if cqi_status.get("status") == "degraded" and not cqi_status.get("missing_components"):
+            raise ValueError("CQI 降级状态缺少明确缺失成分，不能发布")
         cqi = pd.read_csv(cqi_p, index_col=0, parse_dates=True)
         if "data_kind" not in cqi or not cqi["data_kind"].eq("real").all():
             raise ValueError("CQI 缺少真实数据标记或为合成数据；请先运行 cqi.py all")
@@ -202,6 +206,7 @@ def build(f):
         cqi = cqi[["cqi", "灯"]]
         panel = panel.join(cqi.rename(columns={"灯": "cqi_lamp"}))
     panel.attrs["observed"] = f.attrs.get("observed", {})
+    panel.attrs["cqi_status"] = cqi_status
     return panel
 
 
@@ -223,6 +228,11 @@ def report(panel):
         return observed.get(key, fallback)
     L = ["# 判决面板 · 全链数据版", "",
          f"生成时间：{date.today().isoformat()}；日频读数截至各序列最新可得日。阈值继承美债体系卷五，待卷六回测校准。", ""]
+
+    cqi_status = panel.attrs.get("cqi_status", {})
+    if cqi_status.get("status") == "degraded":
+        missing = "、".join(cqi_status["missing_components"])
+        L += [f"> **CQI 降级运行**：缺失成分 {missing}；未沿用失败来源的旧数据。相关回测不能作为正式关口依据。", ""]
 
     # 三边
     L += ["## 三边相变信号", "", "| 边 | 信号 | 当期读数 | 状态 |", "| --- | --- | --- | --- |"]
@@ -364,10 +374,15 @@ def main():
     ap = argparse.ArgumentParser(description="判决面板 · 全链管线")
     ap.add_argument("cmd", choices=["fetch", "build", "all", "demo"])
     a = ap.parse_args()
-    if a.cmd == "all":
-        cmd_fetch(a); cmd_build(a)
-    else:
-        {"fetch": cmd_fetch, "build": cmd_build, "demo": cmd_demo}[a.cmd](a)
+    try:
+        if a.cmd == "all":
+            cmd_fetch(a); cmd_build(a)
+        else:
+            {"fetch": cmd_fetch, "build": cmd_build, "demo": cmd_demo}[a.cmd](a)
+    except Exception as ex:
+        msg = " ".join(str(ex).split())[:900].replace("%", "%25")
+        print(f"::error title=Panel {a.cmd} 失败::{msg}", flush=True)
+        raise
 
 
 if __name__ == "__main__":
