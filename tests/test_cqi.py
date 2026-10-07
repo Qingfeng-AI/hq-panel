@@ -77,6 +77,21 @@ class CQITest(unittest.TestCase):
             with self.assertRaisesRegex(cqi.PipelineError, "incomplete pagination"):
                 cqi.fetch_buybacks()
 
+    def test_buyback_ampersand_pagination_replaces_query(self):
+        from urllib.parse import parse_qs, urlparse
+        row = {"operation_date": "2024-06-07", "total_offered": 300, "total_accepted": 100}
+        pages = [{"data": [row], "links": {"next": "&page%5Bnumber%5D=2&page%5Bsize%5D=1"}},
+                 {"data": [dict(row, operation_date="2024-06-10")], "links": {"next": None},
+                  "meta": {"total-count": 2}}]
+        with patch.object(cqi, "get", side_effect=pages) as get:
+            result = cqi.fetch_buybacks()
+        self.assertEqual(len(result), 2)
+        second_url = get.call_args_list[1].args[0]
+        parsed = urlparse(second_url)
+        self.assertEqual(parsed.path, urlparse(cqi.URL["buybacks"]).path)
+        self.assertEqual(parse_qs(parsed.query)["page[number]"], ["2"])
+        self.assertEqual(parse_qs(parsed.query)["page[size]"], ["1"])
+
     def test_cftc_archive_failure_is_not_silently_skipped(self):
         with patch.object(cqi, "get", side_effect=RuntimeError("network unavailable")):
             with self.assertRaisesRegex(cqi.PipelineError, "CFTC 2016: network unavailable"):
@@ -168,6 +183,12 @@ class CQITest(unittest.TestCase):
         self.assertTrue(out["灯"].eq("数据缺失").all())
         self.assertTrue(out["data_status"].eq("insufficient_components").all())
 
+    def test_no_components_never_looks_healthy(self):
+        with patch.object(cqi, "START", "2024-06-03"):
+            out = cqi.build({})
+        self.assertTrue(out["cqi"].isna().all())
+        self.assertTrue(out["灯"].eq("数据缺失").all())
+
     def test_repo_usage_outside_observation_span_is_unknown(self):
         data = pd.DataFrame({"operationDate": ["2024-06-04", "2024-06-06"], "operationType": ["Repo"] * 2,
                              "totalAmtAccepted": [1e9, 2e9]})
@@ -194,6 +215,17 @@ class CQITest(unittest.TestCase):
         self.assertEqual(target.read_text(), "production sentinel")
         demo = pd.read_csv(cqi.OUT / "demo/cqi_daily.csv")
         self.assertEqual(demo["data_kind"].iloc[0], "synthetic")
+
+    def test_backtest_missing_input_is_nonzero(self):
+        self.assertEqual(cqi.main(["backtest"]), 1)
+
+    def test_backtest_plot_errors_are_nonzero(self):
+        out = self.output()
+        out["data_kind"] = "real"
+        cqi.write_csv(cqi.OUT / "cqi_daily.csv", out, index_label="date")
+        cqi.write_json(cqi.OUT / "build_status.json", {"status": "ok"})
+        with patch.object(cqi, "backtest", return_value=("report", "未通过")), patch.dict("sys.modules", {"matplotlib": None}):
+            self.assertEqual(cqi.main(["backtest"]), 1)
 
 
 if __name__ == "__main__":

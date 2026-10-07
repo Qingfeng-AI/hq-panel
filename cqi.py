@@ -160,6 +160,7 @@ def validate_source(source, df, check_freshness=True):
         usable = df.loc[df["series"].eq("IORB")]
     elif source == "repo_ops":
         df = df.loc[df["operationType"].astype(str).str.strip().str.lower().eq("repo")].copy()
+        df["operationType"] = "Repo"
         usable = df.dropna(subset=numeric)
         if len(usable) != len(df) or (usable["totalAmtAccepted"] < 0).any():
             raise PipelineError("repo_ops: invalid accepted amounts; missing values are not zero")
@@ -277,6 +278,7 @@ def fetch_admin_rate():
     for sid in ("IOER", "IORB"):
         raw = get(URL["fred_csv"].format(sid=sid), as_json=False)
         d = pd.read_csv(io.BytesIO(raw))
+        d.columns = d.columns.str.strip()
         date_col = pick_column(d, ["observation_date", "DATE", "date"], sid, "observation date")
         require_columns(d, [date_col, sid], sid)
         d = d[[date_col, sid]].rename(columns={date_col: "date", sid: "rate"})
