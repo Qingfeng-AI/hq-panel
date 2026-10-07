@@ -28,6 +28,7 @@ class CQITest(unittest.TestCase):
         for name, value in {"RAW": self.root / "data/raw", "OUT": self.root / "data",
                             "REP": self.root / "reports", "END": "2024-06-10"}.items():
             self.stack.enter_context(patch.object(cqi, name, value))
+        self.stack.enter_context(patch.object(cqi, "require_api_key"))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
@@ -59,42 +60,41 @@ class CQITest(unittest.TestCase):
                 cqi.fetch_sofr()
 
     def test_fred_columns_are_validated_not_positional(self):
-        with patch.object(cqi, "get", return_value=b"unexpected,IOER\n2024-06-10,5.0\n"):
-            with self.assertRaisesRegex(cqi.PipelineError, "observation date"):
+        with patch.object(cqi, "fetch_series", return_value=pd.DataFrame({"unexpected": ["2024-06-10"], "value": [5.0]})):
+            with self.assertRaisesRegex(cqi.PipelineError, "missing required columns"):
                 cqi.fetch_admin_rate()
 
     def test_fred_requests_only_needed_dates_and_caps_discontinued_ioer(self):
-        responses = [b"observation_date,IOER\n2021-07-28,0.15\n",
-                     b"observation_date,IORB\n2024-06-10,5.4\n"]
-        with patch.object(cqi, "get", side_effect=responses) as get:
+        responses = [pd.DataFrame({"date": ["2021-07-28"], "value": [0.15]}),
+                     pd.DataFrame({"date": ["2024-06-10"], "value": [5.4]})]
+        with patch.object(cqi, "fetch_series", side_effect=responses) as get:
             result = cqi.fetch_admin_rate()
         self.assertEqual(set(result["series"]), {"IOER", "IORB"})
         for call, sid, end in zip(get.call_args_list, ("IOER", "IORB"), ("2021-07-28", cqi.END)):
-            query = parse_qs(urlparse(call.args[0]).query)
-            self.assertEqual(query, {"id": [sid], "cosd": [cqi.START], "coed": [end]})
-            self.assertFalse(call.kwargs["as_json"])
+            self.assertEqual(call.args, (sid, cqi.START, end))
 
     def test_trust_fetch_validates_named_columns_and_bounded_dates(self):
-        responses = [b"DGS10,observation_date\n4.4,2024-06-10\n",
-                     b"observation_date,DTWEXBGS\n2024-06-07,121.5\n"]
-        with patch.object(cqi, "get", side_effect=responses) as get:
+        responses = [pd.DataFrame({"value": [4.4], "date": ["2024-06-10"]}),
+                     pd.DataFrame({"date": ["2024-06-07"], "value": [121.5]})]
+        with patch.object(cqi, "fetch_series", side_effect=responses) as get:
             result = cqi.fetch_trust()
         self.assertEqual(set(result["series"]), {"DGS10", "DTWEXBGS"})
         self.assertTrue((cqi.RAW / "trust.csv").exists())
         for call, sid in zip(get.call_args_list, ("DGS10", "DTWEXBGS")):
-            self.assertEqual(parse_qs(urlparse(call.args[0]).query),
-                             {"id": [sid], "cosd": [cqi.START], "coed": [cqi.END]})
-            self.assertFalse(call.kwargs["as_json"])
+            self.assertEqual(call.args, (sid, cqi.START, cqi.END))
 
-    def test_fred_failures_identify_the_exact_series(self):
-        scenarios = [(cqi.fetch_admin_rate, "IOER", [RuntimeError("timeout")]),
-                     (cqi.fetch_admin_rate, "IORB", [b"DATE,IOER\n2021-07-28,0.15\n", RuntimeError("timeout")]),
-                     (cqi.fetch_trust, "DGS10", [RuntimeError("timeout")]),
-                     (cqi.fetch_trust, "DTWEXBGS", [b"DATE,DGS10\n2024-06-10,4.4\n", RuntimeError("timeout")])]
+    def test_fred_failures_identify_the_exact_series_without_raw_exception(self):
+        old = pd.DataFrame({"date": ["2021-07-28"], "value": [0.15]})
+        current = pd.DataFrame({"date": ["2024-06-10"], "value": [4.4]})
+        scenarios = [(cqi.fetch_admin_rate, "IOER", [RuntimeError("private details")]),
+                     (cqi.fetch_admin_rate, "IORB", [old, RuntimeError("private details")]),
+                     (cqi.fetch_trust, "DGS10", [RuntimeError("private details")]),
+                     (cqi.fetch_trust, "DTWEXBGS", [current, RuntimeError("private details")])]
         for fetch, sid, responses in scenarios:
-            with self.subTest(series=sid), patch.object(cqi, "get", side_effect=responses):
-                with self.assertRaisesRegex(cqi.PipelineError, sid + ": timeout"):
+            with self.subTest(series=sid), patch.object(cqi, "fetch_series", side_effect=responses):
+                with self.assertRaisesRegex(cqi.PipelineError, sid + ": FRED API request failed") as error:
                     fetch()
+                self.assertNotIn("private details", str(error.exception))
 
     def test_trust_requires_both_series_and_checks_each_freshness(self):
         for stale_sid in ("DGS10", "DTWEXBGS"):
@@ -454,9 +454,15 @@ class CQITest(unittest.TestCase):
         self.assertEqual(json.loads((cqi.OUT / "build_status.json").read_text())["status"], "failed")
 
     def test_all_stops_after_failed_fetch(self):
-        with patch.object(cqi, "cmd_fetch", side_effect=cqi.PipelineError("broken")), patch.object(cqi, "cmd_build") as build:
+        with patch.object(cqi, "require_api_key"), patch.object(cqi, "cmd_fetch", side_effect=cqi.PipelineError("broken")) as fetch, patch.object(cqi, "cmd_build") as build:
             self.assertEqual(cqi.main(["all"]), 1)
+            fetch.assert_called_once()
             build.assert_not_called()
+
+    def test_missing_api_key_stops_cli_before_any_fetch(self):
+        with patch.object(cqi, "require_api_key", side_effect=cqi.FredAPIError("FRED_API_KEY missing")), patch.object(cqi, "cmd_fetch") as fetch:
+            self.assertEqual(cqi.main(["all"]), 1)
+            fetch.assert_not_called()
 
     def test_missing_fetch_manifest_fails_build(self):
         self.assertEqual(cqi.main(["build"]), 1)

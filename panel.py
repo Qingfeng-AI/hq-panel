@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from fred_api import FredAPIError, fetch_series, require_api_key
 
 ROOT = Path(__file__).resolve().parent
 RAW = ROOT / "data" / "raw" / "fred"
@@ -28,7 +29,6 @@ OUT = ROOT / "data"
 REP = ROOT / "reports"
 START = "2015-01-01"
 END = date.today().isoformat()
-FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
 
 # ───────────── FRED 序列（名称：序列代码）─────────────
 SERIES = {
@@ -68,27 +68,16 @@ SIG2_DAYS = 20       # 相关性连续为正多少个交易日视为“持续”
 SIG3_WIN = 126       # 同跌统计窗口（约 6 个月）
 
 
-def get_csv(url, retries=3):
-    from urllib.request import Request, urlopen
-    for i in range(retries):
-        try:
-            with urlopen(Request(url, headers={"User-Agent": "HQ-Research-Panel/0.1"}), timeout=60) as response:
-                return pd.read_csv(io.BytesIO(response.read()))
-        except Exception:
-            if i == retries - 1:
-                raise
-            time.sleep(2 * (i + 1))
-
 
 def cmd_fetch(_):
     RAW.mkdir(parents=True, exist_ok=True)
     failures = []
     for name, sid in SERIES.items():
         try:
-            df = get_csv(FRED.format(sid=sid) + f"&cosd={START}&coed={END}")
-            if df.shape[1] != 2:
-                raise ValueError("FRED 响应必须含日期和一个序列")
-            df.columns = ["date", name]
+            df = fetch_series(sid, START, END)
+            if not {"date", "value"}.issubset(df.columns):
+                raise ValueError("FRED API 响应缺少 date/value")
+            df = df[["date", "value"]].rename(columns={"value": name})
             df["date"] = pd.to_datetime(df["date"], errors="raise")
             df[name] = pd.to_numeric(df[name], errors="coerce")
             if df[name].notna().sum() == 0:
@@ -97,8 +86,9 @@ def cmd_fetch(_):
             print(f"[完成] {name:12s} {sid:14s} {len(df)} 行")
         except Exception as ex:
             failures.append(name)
-            print(f"[失败] {name:12s} {sid:14s} {ex}")
-            print(f"::warning title=面板序列失败 {name}::{sid} " + " ".join(str(ex).split())[:600].replace("%", "%25"), flush=True)
+            detail = str(ex) if isinstance(ex, FredAPIError) else "FRED API response validation failed"
+            print(f"[失败] {name:12s} {sid:14s} {detail}")
+            print(f"::warning title=面板序列失败 {name}::{sid} " + " ".join(detail.split())[:600].replace("%", "%25"), flush=True)
     if failures:
         raise RuntimeError("FRED 抓取未完成，停止生成，避免沿用旧数据：" + ", ".join(failures))
 
@@ -375,6 +365,8 @@ def main():
     ap.add_argument("cmd", choices=["fetch", "build", "all", "demo"])
     a = ap.parse_args()
     try:
+        if a.cmd in {"fetch", "all"}:
+            require_api_key()
         if a.cmd == "all":
             cmd_fetch(a); cmd_build(a)
         else:

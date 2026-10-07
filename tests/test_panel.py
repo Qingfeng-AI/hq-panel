@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -7,13 +9,18 @@ import pandas as pd
 import panel
 
 class PanelTests(unittest.TestCase):
+    def setUp(self):
+        output = contextlib.redirect_stdout(io.StringIO())
+        output.__enter__()
+        self.addCleanup(output.__exit__, None, None, None)
+
     def test_missing_input_is_error(self):
         with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)):
             with self.assertRaisesRegex(ValueError, "缺失"):
                 panel.load_fred()
 
     def test_failed_fetch_is_error(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "get_csv", side_effect=RuntimeError("offline")):
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "fetch_series", side_effect=RuntimeError("offline")):
             with self.assertRaises(RuntimeError):
                 panel.cmd_fetch(None)
 
@@ -49,18 +56,15 @@ class PanelTests(unittest.TestCase):
             self.assertIn("0.10 | 2026-10-06 | —", panel.report(frame))
 
     def test_fred_fetch_requests_only_model_date_range(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "get_csv", return_value=pd.DataFrame({"observation_date": ["2026-10-05"], "DGS10": [4.2]})) as get:
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "fetch_series", return_value=pd.DataFrame({"date": ["2026-10-05"], "value": [4.2]})) as get:
             panel.cmd_fetch(None)
-            self.assertIn("&cosd=" + panel.START + "&coed=" + panel.END, get.call_args.args[0])
+            self.assertEqual(get.call_args.args, ("DGS10", panel.START, panel.END))
 
-    def test_fred_csv_uses_standard_https_client(self):
-        from unittest.mock import MagicMock
-        response = MagicMock()
-        response.__enter__.return_value.read.return_value = b"observation_date,DGS10\n2026-10-05,4.2\n"
-        with patch("urllib.request.urlopen", return_value=response) as call:
-            frame = panel.get_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
-            self.assertEqual(frame.iloc[0]["DGS10"], 4.2)
-            self.assertEqual(call.call_args.kwargs["timeout"], 60)
+    def test_fred_errors_do_not_expose_raw_request_details(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "fetch_series", side_effect=RuntimeError("private request details")):
+            with contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(RuntimeError) as error:
+                panel.cmd_fetch(None)
+            self.assertNotIn("private request details", output.getvalue() + str(error.exception))
 
     def test_degraded_cqi_is_accepted_and_disclosed(self):
         with tempfile.TemporaryDirectory() as root, patch.object(panel, "OUT", Path(root)), patch.object(panel, "MAN", Path(root)), patch.object(panel, "END", "2026-10-07"):

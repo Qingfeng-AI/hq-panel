@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
+from fred_api import FredAPIError, fetch_series, require_api_key
 
 ROOT = Path(__file__).resolve().parent
 RAW = ROOT / "data" / "raw"
@@ -38,7 +39,6 @@ MIN_COMPONENTS = 3               # 合成至少需要 3 个成分有读数
 URL = {
     "sofr": "https://markets.newyorkfed.org/api/rates/secured/sofr/search.json?startDate={s}&endDate={e}",
     "repo_ops": "https://markets.newyorkfed.org/api/rp/results/search.json?startDate={s}&endDate={e}",
-    "fred_csv": "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}",
     "auctions": ("https://www.treasurydirect.gov/TA_WS/securities/search?startDate={s}&endDate={e}"
                  "&dateFieldName=auctionDate&compact=false&format=json"),
     "buybacks": ("https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
@@ -255,13 +255,6 @@ def get(url, as_json=True, retries=3):
     import requests
     for i in range(retries):
         try:
-            if not as_json and url.startswith("https://fred.stlouisfed.org/graph/fredgraph.csv?"):
-                # This same-origin standard-library client is verified on GitHub runners.
-                from urllib.request import Request, urlopen
-                fred_headers = {"User-Agent": "HQ-Research-CQI/0.1 (research pipeline)"}
-                print(f"[FRED] attempt {i + 1}/{retries}: {url}", flush=True)
-                with urlopen(Request(url, headers=fred_headers), timeout=60) as response:
-                    return response.read()
             r = requests.get(url, headers=UA, timeout=60)
             r.raise_for_status()
             return r.json() if as_json else r.content
@@ -318,39 +311,32 @@ def fetch_sofr():
     return save_source("sofr", df)
 
 
+def fred_frame(sid, start, end):
+    try:
+        frame = fetch_series(sid, start, end)
+    except FredAPIError as ex:
+        raise PipelineError(str(ex)) from None
+    except Exception:
+        raise PipelineError(f"{sid}: FRED API request failed") from None
+    require_columns(frame, ["date", "value"], sid)
+    return frame[["date", "value"]].copy()
+
+
 def fetch_admin_rate():
     frames = []
     for sid in ("IOER", "IORB"):
         end = min(END, "2021-07-28") if sid == "IOER" else END
-        url = URL["fred_csv"].format(sid=sid) + "&" + urlencode({"cosd": START, "coed": end})
-        try:
-            raw = get(url, as_json=False)
-        except Exception as ex:
-            raise PipelineError(f"{sid}: {ex}") from ex
-        d = pd.read_csv(io.BytesIO(raw))
-        d.columns = d.columns.str.strip()
-        date_col = pick_column(d, ["observation_date", "DATE", "date"], sid, "observation date")
-        require_columns(d, [date_col, sid], sid)
-        d = d[[date_col, sid]].rename(columns={date_col: "date", sid: "rate"})
+        d = fred_frame(sid, START, end).rename(columns={"value": "rate"})
         d["series"] = sid
         frames.append(d)
     return save_source("admin_rate", pd.concat(frames, ignore_index=True))
 
 
 def fetch_trust():
-    """V0.2 第六成分“信任背离”的输入：FRED 10 年期收益率与广义美元指数。"""
+    """V0.3 信任背离输入，使用官方 FRED observations API。"""
     frames = []
     for sid in ("DGS10", "DTWEXBGS"):
-        url = URL["fred_csv"].format(sid=sid) + "&" + urlencode({"cosd": START, "coed": END})
-        try:
-            raw = get(url, as_json=False)
-        except Exception as ex:
-            raise PipelineError(f"{sid}: {ex}") from ex
-        d = pd.read_csv(io.BytesIO(raw))
-        d.columns = d.columns.str.strip()
-        date_col = pick_column(d, ["observation_date", "DATE", "date"], sid, "observation date")
-        require_columns(d, [date_col, sid], sid)
-        d = d[[date_col, sid]].rename(columns={date_col: "date", sid: "value"})
+        d = fred_frame(sid, START, END)
         d["series"] = sid
         frames.append(d)
     return save_source("trust", pd.concat(frames, ignore_index=True))
@@ -539,9 +525,8 @@ def cmd_fetch(_):
 def cmd_probe(_):
     tests = {
         "sofr": lambda: get(URL["sofr"].format(s="2026-09-01", e="2026-09-05")),
-        "admin_rate": lambda: get(URL["fred_csv"].format(sid="IORB"), as_json=False)[:200],
-        "trust": lambda: {sid: get(URL["fred_csv"].format(sid=sid) + "&" + urlencode({"cosd": START, "coed": END}), as_json=False)[:200].decode("utf-8", "replace")
-                          for sid in ("DGS10", "DTWEXBGS")},
+        "admin_rate": lambda: fred_frame("IORB", START, END).tail(2).astype(str).to_dict("records"),
+        "trust": lambda: {sid: fred_frame(sid, START, END).tail(2).astype(str).to_dict("records") for sid in ("DGS10", "DTWEXBGS")},
         "repo_ops": lambda: get(URL["repo_ops"].format(s="2025-12-29", e="2025-12-31")),
         "auctions": lambda: get(URL["auctions"].format(s="2026-08-10", e="2026-08-14")),
         "buybacks": lambda: get(URL["buybacks"].replace("page[size]=10000", "page[size]=2")),
@@ -903,6 +888,8 @@ def main(argv=None):
     ap.add_argument("cmd", choices=["probe", "fetch", "build", "backtest", "all", "demo"])
     a = ap.parse_args(argv)
     try:
+        if a.cmd in {"fetch", "all", "probe"}:
+            require_api_key()
         if a.cmd == "all":
             cmd_fetch(a); cmd_build(a); cmd_backtest(a)
         else:
