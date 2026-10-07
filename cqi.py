@@ -258,7 +258,9 @@ def get(url, as_json=True, retries=3):
             if not as_json and url.startswith("https://fred.stlouisfed.org/graph/fredgraph.csv?"):
                 # This same-origin standard-library client is verified on GitHub runners.
                 from urllib.request import Request, urlopen
-                with urlopen(Request(url, headers=UA), timeout=60) as response:
+                fred_headers = {"User-Agent": "HQ-Research-CQI/0.1 (research pipeline)"}
+                print(f"[FRED] attempt {i + 1}/{retries}: {url}", flush=True)
+                with urlopen(Request(url, headers=fred_headers), timeout=60) as response:
                     return response.read()
             r = requests.get(url, headers=UA, timeout=60)
             r.raise_for_status()
