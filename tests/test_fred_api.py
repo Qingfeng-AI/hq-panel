@@ -64,6 +64,37 @@ class FredAPITests(unittest.TestCase):
                     self.fetch()
         self.get.assert_not_called()
 
+    def test_format_diagnostics_are_fixed_categories_without_credential_details(self):
+        cases = [
+            (DUMMY_KEY[:8] + " " + DUMMY_KEY[8:], "embedded_whitespace"),
+            ('"' + DUMMY_KEY + '"', "surrounding_or_embedded_quotes"),
+            (DUMMY_KEY + "0", "expected_character_count_not_met"),
+            ("D" + DUMMY_KEY[1:], "disallowed_character_class"),
+        ]
+        for value, category in cases:
+            with self.subTest(category=category), patch.dict(os.environ, {"FRED_API_KEY": value}):
+                try:
+                    fred_api.require_api_key()
+                except fred_api.FredAPIError as error:
+                    text = "".join(traceback.format_exception(error))
+                    expected = f"FRED_API_KEY has an invalid format; category={category}; update the configured secret with only the official key value"
+                    self.assertEqual(str(error), expected)
+                    self.assertNotIn(value, text)
+                    self.assertNotIn(DUMMY_KEY, text)
+                else:
+                    self.fail("malformed fixture was accepted")
+        self.get.assert_not_called()
+
+    def test_official_alphanumeric_keys_are_not_restricted_to_hex(self):
+        with patch.dict(os.environ, {"FRED_API_KEY": "z" * 32}):
+            self.assertIsNone(fred_api.require_api_key())
+        self.get.assert_not_called()
+
+    def test_outer_copy_whitespace_is_trimmed_without_disclosure(self):
+        with patch.dict(os.environ, {"FRED_API_KEY": "  " + DUMMY_KEY + "\n"}):
+            self.assertIsNone(fred_api.require_api_key())
+        self.get.assert_not_called()
+
     def test_levels_native_frequency_https_and_no_redirects(self):
         reply = response(page([{"date": "2024-06-07", "value": "4.5"},
                                {"date": "2024-06-10", "value": "."}]))

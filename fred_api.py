@@ -28,8 +28,20 @@ def _api_key():
     key = os.environ.get("FRED_API_KEY", "").strip()
     if not key:
         raise FredAPIError("FRED_API_KEY is missing; configure the repository secret before fetching") from None
-    if not re.fullmatch(r"[a-z0-9]{32}", key):
-        raise FredAPIError("FRED_API_KEY has an invalid format; check the configured secret") from None
+    # Fixed categories only: never reveal the value, actual length, characters,
+    # prefix/suffix, hash, or any derived identifier in logs.
+    if any(char.isspace() for char in key):
+        category = "embedded_whitespace"
+    elif any(char in key for char in ("'", '"', "`", "“", "”", "‘", "’")):
+        category = "surrounding_or_embedded_quotes"
+    elif len(key) != 32:
+        category = "expected_character_count_not_met"
+    elif not re.fullmatch(r"[a-z0-9]{32}", key):
+        category = "disallowed_character_class"
+    else:
+        category = None
+    if category:
+        raise FredAPIError(f"FRED_API_KEY has an invalid format; category={category}; update the configured secret with only the official key value") from None
     return key
 
 
