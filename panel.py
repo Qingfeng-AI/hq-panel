@@ -69,12 +69,11 @@ SIG3_WIN = 126       # 同跌统计窗口（约 6 个月）
 
 
 def get_csv(url, retries=3):
-    import requests
+    from urllib.request import Request, urlopen
     for i in range(retries):
         try:
-            r = requests.get(url, timeout=60, headers={"User-Agent": "HQ-Research-Panel/0.1"})
-            r.raise_for_status()
-            return pd.read_csv(io.BytesIO(r.content))
+            with urlopen(Request(url, headers={"User-Agent": "HQ-Research-Panel/0.1"}), timeout=60) as response:
+                return pd.read_csv(io.BytesIO(response.read()))
         except Exception:
             if i == retries - 1:
                 raise

@@ -220,6 +220,11 @@ def get(url, as_json=True, retries=3):
     import requests
     for i in range(retries):
         try:
+            if not as_json and url.startswith("https://fred.stlouisfed.org/graph/fredgraph.csv?"):
+                # This same-origin standard-library client is verified on GitHub runners.
+                from urllib.request import Request, urlopen
+                with urlopen(Request(url, headers=UA), timeout=60) as response:
+                    return response.read()
             r = requests.get(url, headers=UA, timeout=60)
             r.raise_for_status()
             return r.json() if as_json else r.content

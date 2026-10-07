@@ -52,3 +52,12 @@ class PanelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.object(panel, "RAW", Path(root)), patch.object(panel, "SERIES", {"y10": "DGS10"}), patch.object(panel, "get_csv", return_value=pd.DataFrame({"observation_date": ["2026-10-05"], "DGS10": [4.2]})) as get:
             panel.cmd_fetch(None)
             self.assertIn("&cosd=" + panel.START + "&coed=" + panel.END, get.call_args.args[0])
+
+    def test_fred_csv_uses_standard_https_client(self):
+        from unittest.mock import MagicMock
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"observation_date,DGS10\n2026-10-05,4.2\n"
+        with patch("urllib.request.urlopen", return_value=response) as call:
+            frame = panel.get_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10")
+            self.assertEqual(frame.iloc[0]["DGS10"], 4.2)
+            self.assertEqual(call.call_args.kwargs["timeout"], 60)
