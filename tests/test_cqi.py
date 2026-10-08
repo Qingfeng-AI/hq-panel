@@ -212,7 +212,7 @@ class CQITest(unittest.TestCase):
     def test_failed_optional_component_is_never_read_from_old_files(self):
         funcs = {k: (lambda bdays: pd.Series(np.arange(len(bdays)), index=bdays)) for k in cqi.COMPONENTS}
         with patch.object(cqi, "COMPONENTS", funcs), patch.dict(funcs, {"央行回购使用量": lambda bdays: self.fail("failed source read")}), \
-                patch.object(cqi, "rolling_z", new=lambda series: series):
+                patch.object(cqi, "rolling_z", new=lambda series, **kwargs: series):
             result = cqi.build(ok_sources=set(cqi.FETCHERS) - {"repo_ops"})
         self.assertNotIn("raw_央行回购使用量", result)
         self.assertNotIn("z_央行回购使用量", result)
@@ -225,7 +225,7 @@ class CQITest(unittest.TestCase):
             funcs = {k: (lambda bdays: pd.Series(np.arange(len(bdays)), index=bdays)) for k in cqi.COMPONENTS}
             funcs[component] = fail
             with self.subTest(component=component), patch.object(cqi, "COMPONENTS", funcs), \
-                    patch.object(cqi, "rolling_z", new=lambda series: series):
+                    patch.object(cqi, "rolling_z", new=lambda series, **kwargs: series):
                 if component != "央行回购使用量":
                     with self.assertRaisesRegex(cqi.PipelineError, "stale local input"):
                         cqi.build(ok_sources=set(cqi.FETCHERS))
@@ -262,7 +262,7 @@ class CQITest(unittest.TestCase):
         for source in cqi.OPTIONAL_SOURCES:
             status["sources"][source] = {"status": "failed", "error": "offline"}
         cqi.write_json(cqi.RAW / "fetch_status.json", status)
-        with patch.object(cqi, "COMPONENTS", funcs), patch.object(cqi, "rolling_z", new=lambda series: series):
+        with patch.object(cqi, "COMPONENTS", funcs), patch.object(cqi, "rolling_z", new=lambda series, **kwargs: series):
             self.assertEqual(cqi.main(["build"]), 1)
         self.assertFalse((cqi.OUT / "cqi_daily.csv").exists())
 
@@ -559,3 +559,34 @@ class CQITest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CQIV04Test(unittest.TestCase):
+    """V0.4：流动性与信任两个子指数取较高者；标准化设实质性下限。"""
+
+    def test_composite_takes_higher_of_liquidity_and_scaled_trust(self):
+        idx = pd.bdate_range("2024-01-02", periods=3)
+        z = pd.DataFrame({"回购压力": [0.5, 2.0, 0.0], "央行回购使用量": [0.5, 2.0, 0.0], "拍卖吸收度": [0.5, 2.0, 0.0],
+                          "回购卖压": [np.nan] * 3, "基差平仓速度": [0.5, 2.0, 0.0], "信任背离": [3.0, 0.0, -1.0]}, index=idx)
+        cqi_s, liq, trust = cqi.composite(z)
+        self.assertAlmostEqual(cqi_s.iloc[0], 1.5)   # 信任 3.0 ÷ 2 = 1.5 高于流动性 0.5
+        self.assertAlmostEqual(cqi_s.iloc[1], 2.0)   # 流动性 2.0 高于信任 0
+        self.assertAlmostEqual(liq.iloc[2], 0.0)
+
+    def test_liquidity_requires_minimum_components(self):
+        idx = pd.bdate_range("2024-01-02", periods=1)
+        z = pd.DataFrame({"回购压力": [1.0], "央行回购使用量": [np.nan], "拍卖吸收度": [np.nan],
+                          "回购卖压": [np.nan], "基差平仓速度": [1.0], "信任背离": [0.0]}, index=idx)
+        cqi_s, liq, _ = cqi.composite(z)
+        self.assertTrue(np.isnan(liq.iloc[0]))
+        self.assertTrue(np.isnan(cqi_s.iloc[0]))
+
+    def test_materiality_floor_suppresses_trivial_moves(self):
+        idx = pd.bdate_range("2021-01-04", periods=400)
+        s = pd.Series(0.0, index=idx)
+        s.iloc[::50] = 0.02            # 常规测试操作：约 0.02 十亿美元
+        s.iloc[-1] = 0.02
+        unfloored = cqi.rolling_z(s, window=300, minp=100)
+        floored = cqi.rolling_z(s, window=300, minp=100, floor=5.0)
+        self.assertGreater(unfloored.iloc[-1], 3)
+        self.assertLess(abs(floored.iloc[-1]), 0.01)
