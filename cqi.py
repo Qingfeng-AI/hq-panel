@@ -34,7 +34,19 @@ Z_WINDOW = 756                   # 滚动 3 年（交易日）
 Z_MIN = 252                      # 至少 1 年才出读数
 BREAK_SIGMA = 2.0                # 断裂规则：单日变动超过 2 个标准差
 YELLOW, RED = 1.0, 2.0           # 初始阈值，回测后校准
-MIN_COMPONENTS = 3               # 合成至少需要 3 个成分有读数
+MIN_COMPONENTS = 3               # 流动性子指数至少需要 3 个成分有读数
+
+# V0.4（2026-10-08，据首次完整回测校准）
+# 一、两类压力分开度量（专题四：流动性型与信任型）：
+#     流动性子指数 = 五个“使用压力”成分的等权均值；信任子指数 = 信任背离的标准化值。
+#     合成 CQI = max(流动性子指数, 信任子指数 / TRUST_SCALE)，以“阈值单位”表达，黄灯 1.0、红灯 2.0 不变。
+#     信任子指数只有一个成分，噪声更大，故其黄灯对应标准化值 2.0、红灯 4.0（约第 95、99 百分位）。
+# 二、实质性下限：标准化时的标准差不得低于经济上有意义的尺度，避免平静期的微小波动被放大成信号。
+LIQUIDITY_COMPONENTS = ("回购压力", "央行回购使用量", "拍卖吸收度", "回购卖压", "基差平仓速度")
+TRUST_COMPONENT = "信任背离"
+TRUST_SCALE = 2.0
+Z_FLOORS = {"回购压力": 5.0,        # 基点
+            "央行回购使用量": 5.0}  # 十亿美元（五日均值）
 
 URL = {
     "sofr": "https://markets.newyorkfed.org/api/rates/secured/sofr/search.json?startDate={s}&endDate={e}",
@@ -61,7 +73,7 @@ MUST_FLAG = ["2019-09 回购利率飙升", "2020-03 现金争夺", "2025-04 关�
 CALM = {"2021 全年": ("2021-01-01", "2021-12-31"), "2024 上半年": ("2024-01-01", "2024-06-30")}
 CALM_MAX_SHARE = 0.10            # 平静期亮黄灯的天数占比上限
 
-UA = {"User-Agent": "HQ-Research-CQI/0.3 (research pipeline)"}
+UA = {"User-Agent": "HQ-Research-CQI/0.4 (research pipeline)"}
 
 # Calendar-day allowances accommodate weekends/publication lags, not unlimited carry-forward.
 SOURCE_FILES = {"sofr": "sofr", "admin_rate": "admin_rate", "trust": "trust", "repo_ops": "repo_ops",
@@ -292,10 +304,22 @@ def num(x):
     return pd.to_numeric(x, errors="coerce")
 
 
-def rolling_z(s, window=Z_WINDOW, minp=Z_MIN):
+def rolling_z(s, window=Z_WINDOW, minp=Z_MIN, floor=None):
     m = s.rolling(window, min_periods=minp).mean()
     sd = s.rolling(window, min_periods=minp).std()
+    if floor is not None:
+        sd = sd.clip(lower=floor)
     return (s - m) / sd.replace(0, np.nan)
+
+
+def composite(z):
+    """V0.4 合成：流动性子指数与信任子指数（折算为阈值单位）取较高者。"""
+    liq_cols = [c for c in LIQUIDITY_COMPONENTS if c in z]
+    n_liq = z[liq_cols].notna().sum(axis=1) if liq_cols else pd.Series(0, index=z.index)
+    liquidity = z[liq_cols].mean(axis=1, skipna=True).where(n_liq >= MIN_COMPONENTS) if liq_cols else pd.Series(np.nan, index=z.index)
+    trust = z[TRUST_COMPONENT] if TRUST_COMPONENT in z else pd.Series(np.nan, index=z.index)
+    cqi = pd.concat([liquidity, trust / TRUST_SCALE], axis=1).max(axis=1, skipna=False)
+    return cqi, liquidity, trust
 
 
 # ───────────────────────── 抓取 ─────────────────────────
@@ -694,14 +718,14 @@ def build(raw_components=None, ok_sources=None):
             raw_components[k] = s
     comp = pd.DataFrame({k: v for k, v in raw_components.items() if v is not None}, index=bdays)
     comp = comp.replace([np.inf, -np.inf], np.nan)
-    z = comp.apply(rolling_z)
+    z = pd.DataFrame({c: rolling_z(comp[c], floor=Z_FLOORS.get(c)) for c in comp.columns}, index=comp.index)
     n_avail = z.notna().sum(axis=1)
-    cqi = z.mean(axis=1, skipna=True).where(n_avail >= MIN_COMPONENTS)
+    cqi, liquidity, trust = composite(z)
     # 断裂规则：任一成分单日变动超过 2 个标准差
     dz = z.diff()
     dsd = dz.rolling(Z_WINDOW, min_periods=Z_MIN).std()
     brk = (dz.abs() > BREAK_SIGMA * dsd)
-    out = pd.DataFrame({"cqi": cqi, "成分数": n_avail,
+    out = pd.DataFrame({"cqi": cqi, "cqi_流动性": liquidity, "cqi_信任": trust, "成分数": n_avail,
                         "断裂": brk.any(axis=1),
                         "断裂成分": brk.apply(lambda r: "、".join(r.index[r]), axis=1)})
     out["灯"] = np.select([out.cqi >= RED, out.cqi >= YELLOW], ["红", "黄"], default="")
@@ -784,14 +808,17 @@ def backtest(out, missing_components=None, degraded=False):
     degraded = degraded or bool(missing_components)
     lines = ["# 抵押品质量指数（公开版）回测报告", "",
              f"阈值：黄灯 ≥ {YELLOW}，红灯 ≥ {RED}；标准化窗口 {Z_WINDOW} 个交易日。", "",
-             "## 压力事件", "", "| 事件 | 窗口内最高 CQI | 灯 | 首次亮灯日 | 主要贡献成分 |", "| --- | --- | --- | --- | --- |"]
+             f"合成方法（V0.4）：CQI = max(流动性子指数, 信任子指数 ÷ {TRUST_SCALE})。流动性子指数为五个使用压力成分的等权均值，"
+             "回购压力与央行回购使用量的标准化设有实质性下限（5 个基点、50 亿美元）。", "",
+             "## 压力事件", "", "| 事件 | 窗口内最高 CQI | 流动性子指数 | 信任子指数 | 灯 | 首次亮灯日 | 主要贡献成分 |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
     zcols = [c for c in out.columns if c.startswith("z_")]
     passed_events = {}
     for name, d in EVENTS.items():
         d = pd.Timestamp(d)
         w = out.loc[d - pd.offsets.BDay(5): d + pd.offsets.BDay(20)]
         if w["cqi"].dropna().empty:
-            lines.append(f"| {name} | 无读数 | — | — | — |")
+            lines.append(f"| {name} | 无读数 | — | — | — | — | — |")
             passed_events[name] = False
             continue
         mx = w["cqi"].max()
@@ -799,7 +826,9 @@ def backtest(out, missing_components=None, degraded=False):
         first = w.index[w["cqi"] >= YELLOW]
         first = first[0].date().isoformat() if len(first) else "—"
         top = w[zcols].max().sort_values(ascending=False).head(2)
-        lines.append(f"| {name} | {mx:.2f} | {lamp} | {first} | "
+        liq_mx = w["cqi_流动性"].max() if "cqi_流动性" in w else float("nan")
+        tru_mx = w["cqi_信任"].max() if "cqi_信任" in w else float("nan")
+        lines.append(f"| {name} | {mx:.2f} | {liq_mx:.2f} | {tru_mx:.2f} | {lamp} | {first} | "
                      + "、".join(f"{k[2:]}({v:.1f})" for k, v in top.items()) + " |")
         passed_events[name] = mx >= YELLOW
     lines += ["", "## 平静期误报", "", "| 时期 | 亮黄灯及以上的天数占比 | 是否合格 |", "| --- | --- | --- |"]
