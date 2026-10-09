@@ -1,47 +1,47 @@
 {
   "status": "ok",
-  "started_at": "2026-10-07T23:52:17.360804+00:00",
-  "as_of": "2026-10-07",
+  "started_at": "2026-10-09T03:02:13.048774+00:00",
+  "as_of": "2026-10-09",
   "sources": {
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2127,
-      "latest_observation": "2026-10-06"
+      "rows": 2128,
+      "latest_observation": "2026-10-07"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3111,
-      "latest_observation": "2026-10-07"
+      "rows": 3113,
+      "latest_observation": "2026-10-09"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4255,
+      "rows": 4256,
       "latest_observation": "2026-10-02",
       "latest_observations": {
-        "DGS10": "2026-10-06",
+        "DGS10": "2026-10-07",
         "DTWEXBGS": "2026-10-02"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2265,
-      "latest_observation": "2026-10-07"
+      "rows": 2267,
+      "latest_observation": "2026-10-08"
     },
     "auctions": {
       "status": "ok",
       "tier": "optional",
-      "rows": 1116,
-      "latest_observation": "2026-10-07"
+      "rows": 1117,
+      "latest_observation": "2026-10-08"
     },
     "buybacks": {
       "status": "ok",
       "tier": "optional",
-      "rows": 191,
-      "latest_observation": "2026-10-06"
+      "rows": 192,
+      "latest_observation": "2026-10-08"
     },
     "cftc": {
       "status": "ok",
@@ -50,6 +50,6 @@
       "latest_observation": "2026-09-29"
     }
   },
-  "completed_at": "2026-10-07T23:52:32.411426+00:00",
+  "completed_at": "2026-10-09T03:02:28.904188+00:00",
   "degraded": []
 }
