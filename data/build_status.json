@@ -1,39 +1,39 @@
 {
   "status": "ok",
-  "generated_at": "2026-10-10T02:35:22.813621+00:00",
-  "as_of": "2026-10-10",
+  "generated_at": "2026-10-14T02:05:30.979572+00:00",
+  "as_of": "2026-10-14",
   "data_kind": "real",
-  "latest_cqi_date": "2026-10-09",
-  "component_count": 6,
+  "latest_cqi_date": "2026-10-14",
+  "component_count": 5,
   "missing_components": [],
   "sources": {
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2129,
-      "latest_observation": "2026-10-08"
+      "rows": 2130,
+      "latest_observation": "2026-10-09"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3114,
-      "latest_observation": "2026-10-10"
+      "rows": 3118,
+      "latest_observation": "2026-10-14"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4257,
-      "latest_observation": "2026-10-02",
+      "rows": 4263,
+      "latest_observation": "2026-10-09",
       "latest_observations": {
-        "DGS10": "2026-10-08",
-        "DTWEXBGS": "2026-10-02"
+        "DGS10": "2026-10-09",
+        "DTWEXBGS": "2026-10-09"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2269,
-      "latest_observation": "2026-10-09"
+      "rows": 2271,
+      "latest_observation": "2026-10-13"
     },
     "auctions": {
       "status": "ok",
