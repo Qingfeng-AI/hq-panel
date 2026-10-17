@@ -1,35 +1,35 @@
 {
   "status": "ok",
-  "started_at": "2026-10-16T01:35:21.242402+00:00",
-  "as_of": "2026-10-16",
+  "started_at": "2026-10-17T01:26:12.661835+00:00",
+  "as_of": "2026-10-17",
   "sources": {
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2132,
-      "latest_observation": "2026-10-14"
+      "rows": 2133,
+      "latest_observation": "2026-10-15"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3120,
-      "latest_observation": "2026-10-16"
+      "rows": 3121,
+      "latest_observation": "2026-10-17"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4265,
+      "rows": 4266,
       "latest_observation": "2026-10-09",
       "latest_observations": {
-        "DGS10": "2026-10-14",
+        "DGS10": "2026-10-15",
         "DTWEXBGS": "2026-10-09"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2275,
-      "latest_observation": "2026-10-15"
+      "rows": 2277,
+      "latest_observation": "2026-10-16"
     },
     "auctions": {
       "status": "ok",
@@ -46,10 +46,10 @@
     "cftc": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2808,
-      "latest_observation": "2026-10-06"
+      "rows": 2813,
+      "latest_observation": "2026-10-13"
     }
   },
-  "completed_at": "2026-10-16T01:35:37.213501+00:00",
+  "completed_at": "2026-10-17T01:26:30.883914+00:00",
   "degraded": []
 }
