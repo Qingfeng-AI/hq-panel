@@ -1,55 +1,56 @@
 {
-  "status": "ok",
-  "started_at": "2026-10-17T01:26:12.661835+00:00",
-  "as_of": "2026-10-17",
+  "status": "degraded",
+  "started_at": "2026-11-07T03:02:42.477359+00:00",
+  "as_of": "2026-11-07",
   "sources": {
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2133,
-      "latest_observation": "2026-10-15"
+      "rows": 2148,
+      "latest_observation": "2026-11-05"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3121,
-      "latest_observation": "2026-10-17"
+      "rows": 3142,
+      "latest_observation": "2026-11-07"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4266,
-      "latest_observation": "2026-10-09",
+      "rows": 4295,
+      "latest_observation": "2026-10-30",
       "latest_observations": {
-        "DGS10": "2026-10-15",
-        "DTWEXBGS": "2026-10-09"
+        "DGS10": "2026-11-05",
+        "DTWEXBGS": "2026-10-30"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2277,
-      "latest_observation": "2026-10-16"
+      "rows": 2308,
+      "latest_observation": "2026-11-06"
     },
     "auctions": {
-      "status": "ok",
+      "status": "failed",
       "tier": "optional",
-      "rows": 1117,
-      "latest_observation": "2026-10-08"
+      "error": "500 Server Error:  for url: https://www.treasurydirect.gov/TA_WS/securities/search?startDate=2016-01-01&endDate=2016-12-31&dateFieldName=auctionDate&compact=false&format=json"
     },
     "buybacks": {
       "status": "ok",
       "tier": "optional",
-      "rows": 193,
-      "latest_observation": "2026-10-15"
+      "rows": 196,
+      "latest_observation": "2026-11-05"
     },
     "cftc": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2813,
-      "latest_observation": "2026-10-13"
+      "rows": 2828,
+      "latest_observation": "2026-11-03"
     }
   },
-  "completed_at": "2026-10-17T01:26:30.883914+00:00",
-  "degraded": []
+  "completed_at": "2026-11-07T03:03:06.027839+00:00",
+  "degraded": [
+    "auctions: 500 Server Error:  for url: https://www.treasurydirect.gov/TA_WS/securities/search?startDate=2016-01-01&endDate=2016-12-31&dateFieldName=auctionDate&compact=false&format=json"
+  ]
 }
