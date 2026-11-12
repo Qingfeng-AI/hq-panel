@@ -1,7 +1,7 @@
 {
   "status": "degraded",
-  "started_at": "2026-11-11T02:56:07.589274+00:00",
-  "as_of": "2026-11-11",
+  "started_at": "2026-11-12T04:02:09.300526+00:00",
+  "as_of": "2026-11-12",
   "sources": {
     "sofr": {
       "status": "ok",
@@ -12,8 +12,8 @@
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3146,
-      "latest_observation": "2026-11-11"
+      "rows": 3147,
+      "latest_observation": "2026-11-12"
     },
     "trust": {
       "status": "ok",
@@ -49,7 +49,7 @@
       "latest_observation": "2026-11-03"
     }
   },
-  "completed_at": "2026-11-11T02:56:36.543283+00:00",
+  "completed_at": "2026-11-12T04:02:36.559600+00:00",
   "degraded": [
     "auctions: 500 Server Error:  for url: https://www.treasurydirect.gov/TA_WS/securities/search?startDate=2016-01-01&endDate=2016-12-31&dateFieldName=auctionDate&compact=false&format=json"
   ]
