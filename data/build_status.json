@@ -1,9 +1,9 @@
 {
   "status": "degraded",
-  "generated_at": "2026-11-14T03:29:14.962050+00:00",
-  "as_of": "2026-11-14",
+  "generated_at": "2026-11-18T04:39:26.958416+00:00",
+  "as_of": "2026-11-18",
   "data_kind": "real",
-  "latest_cqi_date": "2026-11-13",
+  "latest_cqi_date": "2026-11-18",
   "component_count": 4,
   "missing_components": [
     "拍卖吸收度"
@@ -12,30 +12,30 @@
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2152,
-      "latest_observation": "2026-11-12"
+      "rows": 2154,
+      "latest_observation": "2026-11-16"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3149,
-      "latest_observation": "2026-11-14"
+      "rows": 3153,
+      "latest_observation": "2026-11-18"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4304,
-      "latest_observation": "2026-11-06",
+      "rows": 4310,
+      "latest_observation": "2026-11-13",
       "latest_observations": {
-        "DGS10": "2026-11-12",
-        "DTWEXBGS": "2026-11-06"
+        "DGS10": "2026-11-16",
+        "DTWEXBGS": "2026-11-13"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2316,
-      "latest_observation": "2026-11-13"
+      "rows": 2320,
+      "latest_observation": "2026-11-17"
     },
     "auctions": {
       "status": "failed",
@@ -45,14 +45,14 @@
     "buybacks": {
       "status": "ok",
       "tier": "optional",
-      "rows": 196,
-      "latest_observation": "2026-11-05"
+      "rows": 197,
+      "latest_observation": "2026-11-17"
     },
     "cftc": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2828,
-      "latest_observation": "2026-11-03"
+      "rows": 2833,
+      "latest_observation": "2026-11-10"
     }
   }
 }

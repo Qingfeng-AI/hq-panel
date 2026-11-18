@@ -1,35 +1,35 @@
 {
   "status": "degraded",
-  "started_at": "2026-11-14T03:28:38.984088+00:00",
-  "as_of": "2026-11-14",
+  "started_at": "2026-11-18T04:39:09.019447+00:00",
+  "as_of": "2026-11-18",
   "sources": {
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2152,
-      "latest_observation": "2026-11-12"
+      "rows": 2154,
+      "latest_observation": "2026-11-16"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3149,
-      "latest_observation": "2026-11-14"
+      "rows": 3153,
+      "latest_observation": "2026-11-18"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4304,
-      "latest_observation": "2026-11-06",
+      "rows": 4310,
+      "latest_observation": "2026-11-13",
       "latest_observations": {
-        "DGS10": "2026-11-12",
-        "DTWEXBGS": "2026-11-06"
+        "DGS10": "2026-11-16",
+        "DTWEXBGS": "2026-11-13"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2316,
-      "latest_observation": "2026-11-13"
+      "rows": 2320,
+      "latest_observation": "2026-11-17"
     },
     "auctions": {
       "status": "failed",
@@ -39,17 +39,17 @@
     "buybacks": {
       "status": "ok",
       "tier": "optional",
-      "rows": 196,
-      "latest_observation": "2026-11-05"
+      "rows": 197,
+      "latest_observation": "2026-11-17"
     },
     "cftc": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2828,
-      "latest_observation": "2026-11-03"
+      "rows": 2833,
+      "latest_observation": "2026-11-10"
     }
   },
-  "completed_at": "2026-11-14T03:29:14.777391+00:00",
+  "completed_at": "2026-11-18T04:39:26.805293+00:00",
   "degraded": [
     "auctions: 500 Server Error:  for url: https://www.treasurydirect.gov/TA_WS/securities/search?startDate=2016-01-01&endDate=2016-12-31&dateFieldName=auctionDate&compact=false&format=json"
   ]
