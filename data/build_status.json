@@ -1,9 +1,9 @@
 {
   "status": "degraded",
-  "generated_at": "2026-11-18T04:39:26.958416+00:00",
-  "as_of": "2026-11-18",
+  "generated_at": "2026-11-19T04:24:53.596972+00:00",
+  "as_of": "2026-11-19",
   "data_kind": "real",
-  "latest_cqi_date": "2026-11-18",
+  "latest_cqi_date": "2026-11-19",
   "component_count": 4,
   "missing_components": [
     "拍卖吸收度"
@@ -12,30 +12,30 @@
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2154,
-      "latest_observation": "2026-11-16"
+      "rows": 2155,
+      "latest_observation": "2026-11-17"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3153,
-      "latest_observation": "2026-11-18"
+      "rows": 3154,
+      "latest_observation": "2026-11-19"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4310,
+      "rows": 4311,
       "latest_observation": "2026-11-13",
       "latest_observations": {
-        "DGS10": "2026-11-16",
+        "DGS10": "2026-11-17",
         "DTWEXBGS": "2026-11-13"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2320,
-      "latest_observation": "2026-11-17"
+      "rows": 2322,
+      "latest_observation": "2026-11-18"
     },
     "auctions": {
       "status": "failed",

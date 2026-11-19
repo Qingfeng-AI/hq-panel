@@ -1,35 +1,35 @@
 {
   "status": "degraded",
-  "started_at": "2026-11-18T04:39:09.019447+00:00",
-  "as_of": "2026-11-18",
+  "started_at": "2026-11-19T04:24:35.142077+00:00",
+  "as_of": "2026-11-19",
   "sources": {
     "sofr": {
       "status": "ok",
       "tier": "core",
-      "rows": 2154,
-      "latest_observation": "2026-11-16"
+      "rows": 2155,
+      "latest_observation": "2026-11-17"
     },
     "admin_rate": {
       "status": "ok",
       "tier": "core",
-      "rows": 3153,
-      "latest_observation": "2026-11-18"
+      "rows": 3154,
+      "latest_observation": "2026-11-19"
     },
     "trust": {
       "status": "ok",
       "tier": "core",
-      "rows": 4310,
+      "rows": 4311,
       "latest_observation": "2026-11-13",
       "latest_observations": {
-        "DGS10": "2026-11-16",
+        "DGS10": "2026-11-17",
         "DTWEXBGS": "2026-11-13"
       }
     },
     "repo_ops": {
       "status": "ok",
       "tier": "optional",
-      "rows": 2320,
-      "latest_observation": "2026-11-17"
+      "rows": 2322,
+      "latest_observation": "2026-11-18"
     },
     "auctions": {
       "status": "failed",
@@ -49,7 +49,7 @@
       "latest_observation": "2026-11-10"
     }
   },
-  "completed_at": "2026-11-18T04:39:26.805293+00:00",
+  "completed_at": "2026-11-19T04:24:53.390795+00:00",
   "degraded": [
     "auctions: 500 Server Error:  for url: https://www.treasurydirect.gov/TA_WS/securities/search?startDate=2016-01-01&endDate=2016-12-31&dateFieldName=auctionDate&compact=false&format=json"
   ]
